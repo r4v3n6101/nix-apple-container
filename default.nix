@@ -52,6 +52,46 @@ let
         default = true;
         description = "Automatically create host directories for volume mounts if they don't exist.";
       };
+      entrypoint = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Override the image entrypoint.";
+      };
+      user = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Run as this user (UID or UID:GID).";
+      };
+      workdir = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Override the working directory inside the container.";
+      };
+      init = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Run an init process for signal forwarding and zombie reaping.";
+      };
+      ssh = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Forward SSH agent from host into the container.";
+      };
+      network = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Attach to a custom network (macOS 26+).";
+      };
+      readOnly = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Mount the container's root filesystem as read-only.";
+      };
+      labels = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        description = "Container labels for metadata and filtering.";
+      };
       pull = lib.mkOption {
         type = lib.types.enum [ "missing" "always" "never" ];
         default = "missing";
@@ -126,8 +166,17 @@ let
   mkContainerRunScript = name: c:
     let
       args = [ bin "run" "--name" name ]
+        ++ lib.optionals (c.entrypoint != null) [ "--entrypoint" c.entrypoint ]
+        ++ lib.optionals (c.user != null) [ "--user" c.user ]
+        ++ lib.optionals (c.workdir != null) [ "--workdir" c.workdir ]
+        ++ lib.optional c.init "--init"
+        ++ lib.optional c.ssh "--ssh"
+        ++ lib.optional c.readOnly "--read-only"
+        ++ lib.optionals (c.network != null) [ "--network" c.network ]
         ++ (lib.concatMap (e: [ "--env" e ])
           (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
+        ++ (lib.concatMap (l: [ "--label" l ])
+          (lib.mapAttrsToList (k: v: "${k}=${v}") c.labels))
         ++ (lib.concatMap (v: [ "--volume" v ]) c.volumes)
         ++ c.extraArgs
         ++ [ c.image ]

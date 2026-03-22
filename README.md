@@ -82,24 +82,16 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 | `env` | attrs of strings | `{}` | Environment variables |
 | `volumes` | list of strings | `[]` | Volume mounts (`host-path:container-path`, macOS 26+) |
 | `autoCreateMounts` | bool | `true` | Create host directories for volume mounts if they don't exist |
+| `entrypoint` | string or null | `null` | Override the image entrypoint |
+| `user` | string or null | `null` | Run as UID or UID:GID |
+| `workdir` | string or null | `null` | Override working directory |
+| `init` | bool | `false` | Run init for signal forwarding and zombie reaping |
+| `ssh` | bool | `false` | Forward SSH agent from host |
+| `network` | string or null | `null` | Attach to custom network (macOS 26+) |
+| `readOnly` | bool | `false` | Read-only root filesystem |
+| `labels` | attrs of strings | `{}` | Container labels for metadata |
 | `pull` | enum | `"missing"` | `"missing"`, `"always"`, or `"never"` — image pull policy |
-| `extraArgs` | list of strings | `[]` | Extra arguments passed to `container run` |
-
-Common `extraArgs` flags:
-
-| Flag | Example | Description |
-|------|---------|-------------|
-| `--publish` | `"8080:80"` | Port forwarding (host:container) |
-| `--cpus` | `"4"` | CPU count |
-| `--memory` | `"2g"` | Memory limit (pre-allocated to VM) |
-| `--workdir` | `"/app"` | Working directory |
-| `--user` | `"1000:1000"` | Run as UID:GID |
-| `--rm` | | Auto-remove on exit |
-| `--init` | | Signal forwarding + zombie cleanup |
-| `--ssh` | | Forward SSH agent |
-| `--dns` | `"1.1.1.1"` | DNS nameserver |
-| `--network` | `"my-net"` | Attach to network (macOS 26) |
-| `--rosetta` | | Rosetta emulation |
+| `extraArgs` | list of strings | `[]` | Extra arguments passed to `container run` (e.g. `--publish`, `--cpus`, `--memory`) |
 
 ### `services.containerization.images.<name>`
 
@@ -172,23 +164,23 @@ services.containerization = {
 ### Nix-built OCI image
 
 ```nix
-services.containerization = {
-  enable = true;
+# Container images need Linux packages, not macOS packages
+{ pkgs, ... }:
+let
+  pkgsLinux = import pkgs.path { system = "aarch64-linux"; };
+in {
+  services.containerization = {
+    enable = true;
 
-  images.dev = {
-    image = pkgsLinux.dockerTools.buildLayeredImage {
-      name = "dev";
-      tag = "latest";
-      contents = with pkgsLinux; [ bashInteractive coreutils git ];
-      config.Cmd = [ "/bin/bash" ];
+    images.hello = {
+      image = pkgsLinux.dockerTools.buildImage {
+        name = "hello";
+        tag = "latest";
+        config.Cmd = [ "${pkgsLinux.hello}/bin/hello" ];
+      };
     };
   };
-
-  containers.dev = {
-    image = "dev:latest";
-    autoStart = false; # run manually: container run -it dev:latest
-  };
-};
+}
 ```
 
 ### Aggressive garbage collection
