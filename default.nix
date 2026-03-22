@@ -113,11 +113,20 @@ let
     '')
   ];
 
-  mkContainerArgs = name: c:
-    [ bin "run" "--name" name ] ++ (lib.concatMap (e: [ "--env" e ])
-      (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
-    ++ (lib.concatMap (v: [ "--volume" v ]) c.volumes) ++ c.extraArgs
-    ++ [ c.image ] ++ c.cmd;
+  mkContainerRunScript = name: c:
+    let
+      args = [ bin "run" "--name" name ]
+        ++ (lib.concatMap (e: [ "--env" e ])
+          (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
+        ++ (lib.concatMap (v: [ "--volume" v ]) c.volumes)
+        ++ c.extraArgs
+        ++ [ c.image ]
+        ++ c.cmd;
+    in pkgs.writeShellScript "container-run-${name}" ''
+      ${bin} stop ${lib.escapeShellArg name} 2>/dev/null || true
+      ${bin} rm ${lib.escapeShellArg name} 2>/dev/null || true
+      exec ${lib.escapeShellArgs args}
+    '';
 
 in {
   options.services.containerization = {
@@ -231,7 +240,7 @@ in {
         lib.nameValuePair "container-${name}" {
           serviceConfig = {
             Label = "dev.apple.container.${name}";
-            ProgramArguments = mkContainerArgs name c;
+            ProgramArguments = [ (toString (mkContainerRunScript name c)) ];
             RunAtLoad = true;
             KeepAlive = true;
             StandardOutPath =

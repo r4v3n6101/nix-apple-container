@@ -9,7 +9,7 @@ A nix-darwin module for declaratively managing [Apple Containerization](https://
 - Packages the `container` CLI from Apple's `.pkg` release via Nix (no Homebrew needed)
 - Manages the Linux kernel as a Nix derivation (no runtime download from GitHub)
 - Starts the container runtime and installs the kernel automatically
-- Declares containers that run as launchd user agents
+- Declares containers that run as launchd user agents (automatically recreated on config change)
 - Loads Nix-built OCI images (via `dockerTools`) into the runtime on activation
 - Auto-creates host directories for volume mounts
 - Reconciles running containers against config — removes undeclared containers and their launchd agents
@@ -53,7 +53,7 @@ Import the module in your darwin host config:
 }
 ```
 
-After `darwin-rebuild switch`, the container runtime starts, the image is pulled, and the container runs as a launchd user agent.
+After `darwin-rebuild switch`, the container runtime starts, the image is pulled, and the container runs as a launchd user agent. Changing any container option (image, env, volumes, ports) and rebuilding will automatically stop the old container and start a fresh one with the new config.
 
 ## Options
 
