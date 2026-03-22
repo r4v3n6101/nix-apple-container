@@ -128,6 +128,25 @@ in {
       description = "Containers to manage.";
     };
 
+    kernel = {
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.callPackage ./kernel.nix { };
+        description = "Kata kernel tarball (passed to container system kernel set --tar).";
+      };
+      binaryPath = lib.mkOption {
+        type = lib.types.str;
+        default = "opt/kata/share/kata-containers/vmlinux-6.18.5-177";
+        description = "Path to the kernel binary within the tar archive.";
+      };
+    };
+
+    teardown.removeImages = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Remove pulled container images when disabling. If false, only runtime state and kernels are removed.";
+    };
+
     gc = {
       automatic = lib.mkOption {
         type = lib.types.bool;
@@ -164,8 +183,17 @@ in {
 
           ${runAs} ${bin} system stop 2>/dev/null || true
 
-          echo "nix-apple-container: removing data ($APP_SUPPORT)..."
-          rm -rf "$APP_SUPPORT"
+          # Kernels are cheap to reinstall from Nix store
+          rm -rf "$APP_SUPPORT/kernels"
+
+          # API server plist is regenerated on system start
+          rm -rf "$APP_SUPPORT/apiserver"
+
+          if [ "${lib.boolToString cfg.teardown.removeImages}" = "true" ]; then
+            echo "nix-apple-container: removing images..."
+            rm -rf "$APP_SUPPORT/content"
+            rm -rf "$APP_SUPPORT"
+          fi
 
           ${runAs} defaults delete com.apple.container 2>/dev/null || true
 
@@ -198,25 +226,74 @@ in {
       system.activationScripts.preActivation.text = lib.mkAfter
         (lib.concatStrings [
           ''
-            if ! ${runAs} ${bin} system info &>/dev/null; then
+            if ! ${runAs} ${bin} system status &>/dev/null; then
               echo "nix-apple-container: starting runtime..."
               ${runAs} ${bin} system start --disable-kernel-install 2>/dev/null || true
             fi
             KERNEL_DIR="$(eval echo "~${cfg.user}")/Library/Application Support/com.apple.container/kernels"
             if [ ! -d "$KERNEL_DIR" ] || [ -z "$(ls -A "$KERNEL_DIR" 2>/dev/null)" ]; then
               echo "nix-apple-container: installing kernel..."
-              ${runAs} ${bin} system kernel set --recommended 2>/dev/null || true
+              ${runAs} ${bin} system kernel set \
+                --tar ${cfg.kernel.package} \
+                --binary ${cfg.kernel.binaryPath} \
+                --force 2>/dev/null || true
             fi
           ''
           (lib.optionalString cfg.gc.automatic gcScript)
         ]);
 
-      # Image loading runs after launchd setup
-      system.activationScripts.postActivation.text = lib.mkAfter
-        (lib.optionalString (autoLoadImages != { }) ''
+      # Reconcile containers: unload stale launchd agents, then stop+rm undeclared containers.
+      # We must unload agents ourselves because nix-darwin's userLaunchd script is conditional
+      # on having user agents in the NEW config — if all containers are removed, it never runs
+      # and old agents with KeepAlive=true keep restarting containers.
+      system.activationScripts.postActivation.text = lib.mkAfter (
+        let
+          # Plist filenames are based on serviceConfig.Label, not the attribute name
+          declaredAgentNames = lib.concatStringsSep " " (map (n: "dev.apple.container.${n}") (lib.attrNames autoStartContainers));
+        in ''
+          echo "nix-apple-container: reconciling containers..."
+          CONTAINER_USER="${cfg.user}"
+          CONTAINER_UID=$(id -u "$CONTAINER_USER")
+          AGENT_DIR="$(eval echo "~$CONTAINER_USER")/Library/LaunchAgents"
+          DECLARED_AGENTS="${declaredAgentNames}"
+
+          # Unload and remove stale launchd agents before stopping containers,
+          # otherwise KeepAlive=true restarts them immediately.
+          # nix-darwin's userLaunchd cleanup is conditional on having agents in the
+          # new config — if all containers are removed, it skips cleanup entirely.
+          for plist in "$AGENT_DIR"/dev.apple.container.*.plist; do
+            [ -f "$plist" ] || continue
+            agent_name="$(basename "$plist" .plist)"
+            KEEP=false
+            for d in $DECLARED_AGENTS; do
+              if [ "$agent_name" = "$d" ]; then KEEP=true; break; fi
+            done
+            if [ "$KEEP" = "false" ]; then
+              echo "nix-apple-container: unloading stale agent $agent_name..."
+              launchctl asuser "$CONTAINER_UID" sudo --user="$CONTAINER_USER" -- launchctl unload "$plist" 2>/dev/null || true
+              sudo --user="$CONTAINER_USER" -- rm -f "$plist"
+            fi
+          done
+
+          # Now stop and remove containers not declared in config
+          DECLARED="${declaredContainerNames}"
+          for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${pkgs.jq}/bin/jq -r '.[].configuration.id // empty' 2>/dev/null); do
+            KEEP=false
+            for d in $DECLARED; do
+              if [ "$cid" = "$d" ]; then KEEP=true; break; fi
+            done
+            if [ "$KEEP" = "false" ]; then
+              echo "nix-apple-container: stopping undeclared container $cid..."
+              ${runAs} ${bin} stop "$cid" 2>/dev/null || true
+              ${runAs} ${bin} rm "$cid" 2>/dev/null || true
+            fi
+          done
+        ''
+        + lib.optionalString (autoLoadImages != { }) ''
           echo "nix-apple-container: loading images..."
           ${imageLoadScript}
-        '');
+        ''
+      );
     })
   ];
 }

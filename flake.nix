@@ -11,5 +11,7 @@
 
     packages.aarch64-darwin.default =
       nixpkgs.legacyPackages.aarch64-darwin.callPackage ./package.nix { };
+    packages.aarch64-darwin.kernel =
+      nixpkgs.legacyPackages.aarch64-darwin.callPackage ./kernel.nix { };
   };
 }
