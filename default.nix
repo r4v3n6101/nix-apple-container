@@ -3,6 +3,7 @@
 let
   cfg = config.services.containerization;
   bin = lib.getExe cfg.package;
+  runAs = "sudo -u ${cfg.user} --";
 
   imageSubmodule = lib.types.submodule {
     options = {
@@ -56,28 +57,42 @@ let
   autoStartContainers = lib.filterAttrs (_: c: c.autoStart) cfg.containers;
 
   imageLoadScript = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: img: ''
-    echo "Loading container image: ${name}..."
-    ${bin} image load < ${img.image}
+    echo "nix-apple-container: loading image ${name}..."
+    ${runAs} ${bin} image load < ${img.image}
   '') autoLoadImages);
 
-  pullScript = lib.concatMapStringsSep "\n" (img: ''
-    echo "Pulling image: ${img}..."
-    ${bin} image pull ${img}
-  '') cfg.pulls;
+
+  declaredContainerNames = lib.concatStringsSep " " (lib.attrNames cfg.containers);
 
   gcScript = lib.concatStrings [
-    (lib.optionalString cfg.gc.pruneContainers ''
-      echo "Pruning stopped containers..."
-      ${bin} prune || true
+    (lib.optionalString (cfg.gc.pruneContainers == "stopped") ''
+      echo "nix-apple-container: pruning stopped containers..."
+      ${runAs} ${bin} prune || true
+    '')
+    (lib.optionalString (cfg.gc.pruneContainers == "running") ''
+      echo "nix-apple-container: pruning containers not in config..."
+      DECLARED="${declaredContainerNames}"
+      for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${pkgs.jq}/bin/jq -r '.[].configuration.id // empty' 2>/dev/null); do
+        KEEP=false
+        for d in $DECLARED; do
+          if [ "$cid" = "$d" ]; then KEEP=true; break; fi
+        done
+        if [ "$KEEP" = "false" ]; then
+          echo "nix-apple-container: removing undeclared container $cid..."
+          ${runAs} ${bin} stop "$cid" 2>/dev/null || true
+          ${runAs} ${bin} rm "$cid" 2>/dev/null || true
+        fi
+      done
+      ${runAs} ${bin} prune || true
     '')
     (lib.optionalString cfg.gc.pruneImages ''
-      echo "Pruning unused images..."
-      ${bin} image prune || true
+      echo "nix-apple-container: pruning unused images..."
+      ${runAs} ${bin} image prune || true
     '')
   ];
 
   mkContainerArgs = name: c:
-    [ bin "run" "--detach" "--name" name ]
+    [ bin "run" "--name" name ]
     ++ (lib.concatMap (e: [ "--env" e ])
       (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
     ++ (lib.concatMap (v: [ "--volume" v ]) c.volumes)
@@ -89,6 +104,12 @@ in {
   options.services.containerization = {
     enable = lib.mkEnableOption "Apple Containerization framework";
 
+    user = lib.mkOption {
+      type = lib.types.str;
+      default = config.system.primaryUser;
+      description = "User to run container commands as (activation runs as root).";
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.callPackage ./package.nix { };
@@ -99,13 +120,6 @@ in {
       type = lib.types.attrsOf imageSubmodule;
       default = { };
       description = "Nix-built OCI images to load into the container runtime.";
-    };
-
-    pulls = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      example = [ "ubuntu:latest" "alpine:3.19" ];
-      description = "Registry images to pull on activation.";
     };
 
     containers = lib.mkOption {
@@ -121,9 +135,14 @@ in {
         description = "Run garbage collection on activation.";
       };
       pruneContainers = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Remove stopped containers during gc.";
+        type = lib.types.enum [ "none" "stopped" "running" ];
+        default = "stopped";
+        description = ''
+          Container cleanup strategy during gc.
+          - "none": don't touch containers
+          - "stopped": remove stopped containers not in config
+          - "running": stop and remove containers not in config
+        '';
       };
       pruneImages = lib.mkOption {
         type = lib.types.bool;
@@ -133,42 +152,74 @@ in {
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+  config = lib.mkMerge [
+    # Teardown: runs when module is disabled
+    (lib.mkIf (!cfg.enable) {
+      system.activationScripts.postActivation.text = lib.mkAfter ''
+        echo "nix-apple-container: tearing down..."
+        CONTAINER_USER="${cfg.user}"
+        CONTAINER_HOME=$(eval echo "~$CONTAINER_USER")
 
-    launchd.daemons = {
-      "container-runtime" = {
-        serviceConfig = {
-          Label = "dev.apple.container-runtime";
-          ProgramArguments = [ bin "system" "start" ];
-          RunAtLoad = true;
-          KeepAlive = true;
-          StandardOutPath = "/var/log/container-runtime.log";
-          StandardErrorPath = "/var/log/container-runtime.err";
-        };
-      };
-    } // lib.mapAttrs' (name: c:
-      lib.nameValuePair "container-${name}" {
-        serviceConfig = {
-          Label = "dev.apple.container.${name}";
-          ProgramArguments = mkContainerArgs name c;
-          RunAtLoad = true;
-          KeepAlive = true;
-          StandardOutPath = "/var/log/container-${name}.log";
-          StandardErrorPath = "/var/log/container-${name}.err";
-        };
-      }
-    ) autoStartContainers;
+        # Stop the runtime
+        sudo -u "$CONTAINER_USER" -- container system stop 2>/dev/null || true
 
-    system.activationScripts.postActivation.text = lib.mkAfter (
-      lib.concatStrings [
-        (lib.optionalString (autoLoadImages != { }) ''
-          echo "Loading container images..."
+        # Remove user data and kernels
+        APP_SUPPORT="$CONTAINER_HOME/Library/Application Support/com.apple.container"
+        if [ -d "$APP_SUPPORT" ]; then
+          echo "nix-apple-container: removing data ($APP_SUPPORT)..."
+          rm -rf "$APP_SUPPORT"
+        fi
+
+        # Remove user preference defaults
+        sudo -u "$CONTAINER_USER" -- defaults delete com.apple.container 2>/dev/null || true
+
+        # Clean up package receipt if it exists (from .pkg installs)
+        pkgutil --pkg-info com.apple.container-installer &>/dev/null && \
+          sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
+      '';
+    })
+
+    # Setup: runs when module is enabled
+    (lib.mkIf cfg.enable {
+      environment.systemPackages = [ cfg.package ];
+
+      launchd.user.agents = lib.mapAttrs' (name: c:
+        lib.nameValuePair "container-${name}" {
+          serviceConfig = {
+            Label = "dev.apple.container.${name}";
+            ProgramArguments = mkContainerArgs name c;
+            RunAtLoad = true;
+            KeepAlive = true;
+            StandardOutPath = "/Users/${cfg.user}/Library/Logs/container-${name}.log";
+            StandardErrorPath = "/Users/${cfg.user}/Library/Logs/container-${name}.err";
+          };
+        }
+      ) autoStartContainers;
+
+      # GC runs before launchd setup so stale containers are cleaned
+      # before new ones try to start
+      system.activationScripts.preActivation.text = lib.mkAfter (
+        lib.concatStrings [
+          ''
+            echo "nix-apple-container: starting runtime..."
+            ${runAs} ${bin} system start --disable-kernel-install 2>/dev/null || true
+            KERNEL_DIR="$(eval echo "~${cfg.user}")/Library/Application Support/com.apple.container/kernels"
+            if [ ! -d "$KERNEL_DIR" ] || [ -z "$(ls -A "$KERNEL_DIR" 2>/dev/null)" ]; then
+              echo "nix-apple-container: installing kernel..."
+              ${runAs} ${bin} system kernel set --recommended 2>/dev/null || true
+            fi
+          ''
+          (lib.optionalString cfg.gc.automatic gcScript)
+        ]
+      );
+
+      # Image loading runs after launchd setup
+      system.activationScripts.postActivation.text = lib.mkAfter (
+        lib.optionalString (autoLoadImages != { }) ''
+          echo "nix-apple-container: loading images..."
           ${imageLoadScript}
-        '')
-        (lib.optionalString (cfg.pulls != [ ]) pullScript)
-        (lib.optionalString cfg.gc.automatic gcScript)
-      ]
-    );
-  };
+        ''
+      );
+    })
+  ];
 }
