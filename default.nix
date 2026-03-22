@@ -47,6 +47,11 @@ let
         default = [ ];
         description = "Volume mounts (macOS 26+).";
       };
+      autoCreateMounts = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Automatically create host directories for volume mounts if they don't exist.";
+      };
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -57,6 +62,21 @@ let
 
   autoLoadImages = lib.filterAttrs (_: i: i.autoLoad) cfg.images;
   autoStartContainers = lib.filterAttrs (_: c: c.autoStart) cfg.containers;
+
+  # Extract host paths from volume strings (host:container) for containers with autoCreateMounts
+  mkMountDirsScript = lib.concatStrings (lib.mapAttrsToList (name: c:
+    lib.optionalString (c.autoCreateMounts && c.volumes != [ ]) (
+      lib.concatMapStrings (v:
+        let hostPath = builtins.head (lib.splitString ":" v);
+        in ''
+          if [ ! -d "${hostPath}" ]; then
+            echo "nix-apple-container: creating mount ${hostPath} for ${name}..."
+            ${runAs} mkdir -p "${hostPath}"
+          fi
+        ''
+      ) c.volumes
+    )
+  ) cfg.containers);
 
   imageLoadScript = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: img: ''
     echo "nix-apple-container: loading image ${name}..."
@@ -239,6 +259,7 @@ in {
                 --force 2>/dev/null || true
             fi
           ''
+          mkMountDirsScript
           (lib.optionalString cfg.gc.automatic gcScript)
         ]);
 
