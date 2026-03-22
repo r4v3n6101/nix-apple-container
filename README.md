@@ -7,16 +7,19 @@ A nix-darwin module for declaratively managing [Apple Containerization](https://
 ## What it does
 
 - Packages the `container` CLI from Apple's `.pkg` release via Nix (no Homebrew needed)
-- Starts the container runtime and installs the Linux kernel automatically
+- Manages the Linux kernel as a Nix derivation (no runtime download from GitHub)
+- Starts the container runtime and installs the kernel automatically
 - Declares containers that run as launchd user agents
 - Loads Nix-built OCI images (via `dockerTools`) into the runtime on activation
+- Auto-creates host directories for volume mounts
+- Reconciles running containers against config — removes undeclared containers and their launchd agents
 - Garbage-collects containers and images not in your config
-- Clean teardown when disabled — stops runtime, removes kernels, clears user data
+- Selective teardown when disabled — optionally preserves pulled images across disable/enable cycles
 
 ## Requirements
 
 - Apple Silicon Mac (aarch64-darwin)
-- macOS 15+ (macOS 26 recommended for full networking support)
+- macOS 15+ (macOS 26 required for volume mounts and full networking)
 - nix-darwin
 
 ## Usage
@@ -62,6 +65,13 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 | `user` | string | `config.system.primaryUser` | User to run container commands as (activation scripts run as root) |
 | `package` | package | *built from .pkg* | Override the container CLI package |
 
+### `services.containerization.kernel`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `package` | package | *kata 3.26.0 arm64* | Kata kernel tarball — lives in Nix store, survives teardown |
+| `binaryPath` | string | `"opt/kata/share/..."` | Path to the kernel binary within the tar archive |
+
 ### `services.containerization.containers.<name>`
 
 | Option | Type | Default | Description |
@@ -70,7 +80,8 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 | `autoStart` | bool | `false` | Run via launchd user agent on login |
 | `cmd` | list of strings | `[]` | Override the image CMD |
 | `env` | attrs of strings | `{}` | Environment variables |
-| `volumes` | list of strings | `[]` | Volume mounts (`host-path:container-path`) |
+| `volumes` | list of strings | `[]` | Volume mounts (`host-path:container-path`, macOS 26+) |
+| `autoCreateMounts` | bool | `true` | Create host directories for volume mounts if they don't exist |
 | `extraArgs` | list of strings | `[]` | Extra arguments passed to `container run` |
 
 Common `extraArgs` flags:
@@ -79,7 +90,7 @@ Common `extraArgs` flags:
 |------|---------|-------------|
 | `--publish` | `"8080:80"` | Port forwarding (host:container) |
 | `--cpus` | `"4"` | CPU count |
-| `--memory` | `"2g"` | Memory limit |
+| `--memory` | `"2g"` | Memory limit (pre-allocated to VM) |
 | `--workdir` | `"/app"` | Working directory |
 | `--user` | `"1000:1000"` | Run as UID:GID |
 | `--rm` | | Auto-remove on exit |
@@ -109,6 +120,14 @@ Common `extraArgs` flags:
 - `"stopped"` — remove stopped containers
 - `"running"` — stop and remove containers not declared in config, then prune stopped
 
+> Note: Containers removed from config are always stopped and cleaned up on rebuild, regardless of GC settings. The GC options control cleanup of ad-hoc containers created outside your Nix config.
+
+### `services.containerization.teardown`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `removeImages` | bool | `false` | Remove pulled images when disabling. If false, images survive disable/enable cycles |
+
 ## Examples
 
 ### Minimal
@@ -126,6 +145,25 @@ services.containerization = {
     image = "nginx:alpine";
     autoStart = true;
     extraArgs = [ "--publish" "8080:80" ];
+  };
+};
+```
+
+### Gitea with persistent storage
+
+```nix
+services.containerization = {
+  enable = true;
+  containers.gitea = {
+    image = "gitea/gitea:latest";
+    autoStart = true;
+    volumes = [
+      "/Users/me/.gitea/data:/data"
+    ];
+    extraArgs = [
+      "--publish" "3000:3000"
+      "--publish" "2222:22"
+    ];
   };
 };
 ```
@@ -163,15 +201,31 @@ services.containerization = {
 };
 ```
 
+### Custom kernel version
+
+```nix
+services.containerization = {
+  enable = true;
+  kernel.package = pkgs.fetchurl {
+    url = "https://github.com/kata-containers/kata-containers/releases/download/3.26.0/kata-static-3.26.0-arm64.tar.zst";
+    hash = "sha256-g89Z0G72ZWUzj3jrR8NKSIXY15MSF4ZQ77Wyza01eSI=";
+  };
+  kernel.binaryPath = "opt/kata/share/kata-containers/vmlinux-6.18.5-177";
+};
+```
+
 ## Uninstall
 
 Set `enable = false` and rebuild. The module will:
 
 1. Stop the container runtime
-2. Remove `~/Library/Application Support/com.apple.container/`
-3. Clear user preference defaults
-4. Clean up any `.pkg` install receipts
-5. Launchd agents are removed automatically by nix-darwin
+2. Remove kernels and API server state (cheap to reinstall from Nix store)
+3. Clear user preference defaults and `.pkg` install receipts
+4. Launchd agents are removed automatically by nix-darwin
+
+Pulled images are preserved by default. Set `teardown.removeImages = true` to remove everything.
+
+If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import.
 
 ## License
 
