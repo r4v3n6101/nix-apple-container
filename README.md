@@ -29,7 +29,7 @@ Add the flake input:
 ```nix
 {
   inputs = {
-    nix-apple-container.url = "github:your-user/nix-apple-container";
+    nix-apple-container.url = "github:halfwhey/nix-apple-container";
     nix-apple-container.inputs.nixpkgs.follows = "nixpkgs";
   };
 }
