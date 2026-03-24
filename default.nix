@@ -5,6 +5,15 @@ let
   bin = lib.getExe cfg.package;
   runAs = "sudo -u ${cfg.user} --";
 
+  stateDir = "/var/lib/nix-apple-container";
+  kernelIdentity = "${cfg.kernel.package}:${cfg.kernel.binaryPath}";
+  kernelIdentityFile = "${stateDir}/kernel-identity";
+  userHome =
+    if config.users.users ? ${cfg.user} then
+      config.users.users.${cfg.user}.home
+    else
+      "/Users/${cfg.user}";
+
   containerSubmodule = lib.types.submodule {
     options = {
       image = lib.mkOption {
@@ -101,7 +110,7 @@ let
     lib.optionalString (c.autoCreateMounts && c.volumes != [ ]) (
       lib.concatMapStrings (v:
         let hostPath = builtins.head (lib.splitString ":" v);
-        in ''
+        in lib.optionalString (lib.hasPrefix "/" hostPath) ''
           if [ ! -d "${hostPath}" ]; then
             echo "nix-apple-container: creating mount ${hostPath} for ${name}..."
             ${runAs} mkdir -p "${hostPath}"
@@ -136,47 +145,58 @@ let
       ${runAs} ${bin} prune || true
     '')
     (lib.optionalString cfg.gc.pruneImages ''
-      echo "nix-apple-container: pruning unused images..."
+      echo "nix-apple-container: pruning dangling images..."
       ${runAs} ${bin} image prune || true
     '')
   ];
 
-  imageLoadScript = let
-    declaredImageNames = lib.concatStringsSep " " (lib.attrNames cfg.images);
-  in lib.optionalString (cfg.images != { }) ''
-    MARKER_DIR="/var/lib/nix-apple-container/images"
+  imageLoadScript = lib.optionalString (cfg.images != { }) ''
+    MARKER_DIR="${stateDir}/images"
     mkdir -p "$MARKER_DIR"
 
     ${lib.concatStrings (lib.mapAttrsToList (name: img: ''
       if [ "$(cat "$MARKER_DIR/${name}" 2>/dev/null)" != "${img.copyTo}" ]; then
         echo "nix-apple-container: loading image ${img.imageName}:${img.imageTag}..."
-        tmpdir=$(mktemp -d -t nix-apple-container-image.XXXXXX)
-        "${img.copyTo}/bin/copy-to" "oci:$tmpdir:${img.imageName}:${img.imageTag}"
-        tar -C "$tmpdir" -cf "$tmpdir.tar" .
-        chmod 644 "$tmpdir.tar"
-        ${runAs} ${bin} image load -i "$tmpdir.tar"
-        rm -rf "$tmpdir" "$tmpdir.tar"
-        echo "${img.copyTo}" > "$MARKER_DIR/${name}"
+        if (
+          set -e
+          tmpdir=$(mktemp -d -t nix-apple-container-image.XXXXXX)
+          trap 'rm -rf "$tmpdir" "$tmpdir.tar"' EXIT
+          "${img.copyTo}/bin/copy-to" "oci:$tmpdir:${img.imageName}:${img.imageTag}"
+          tar -C "$tmpdir" -cf "$tmpdir.tar" .
+          chmod 644 "$tmpdir.tar"
+          ${runAs} ${bin} image load -i "$tmpdir.tar"
+        ); then
+          echo "${img.copyTo}" > "$MARKER_DIR/${name}"
+        else
+          echo "nix-apple-container: ERROR: failed to load image ${img.imageName}:${img.imageTag}" >&2
+        fi
       fi
     '') cfg.images)}
+  '';
 
-    # Clean stale markers for images no longer in config
-    DECLARED_IMAGES="${declaredImageNames}"
-    for marker in "$MARKER_DIR"/*; do
-      [ -f "$marker" ] || continue
-      mname="$(basename "$marker")"
-      KEEP=false
-      for d in $DECLARED_IMAGES; do
-        if [ "$mname" = "$d" ]; then KEEP=true; break; fi
+  # Always run stale marker cleanup (even when cfg.images == {})
+  imageMarkerCleanupScript = ''
+    MARKER_DIR="${stateDir}/images"
+    if [ -d "$MARKER_DIR" ]; then
+      DECLARED_IMAGES="${lib.concatStringsSep " " (lib.attrNames cfg.images)}"
+      for marker in "$MARKER_DIR"/*; do
+        [ -f "$marker" ] || continue
+        mname="$(basename "$marker")"
+        KEEP=false
+        for d in $DECLARED_IMAGES; do
+          if [ "$mname" = "$d" ]; then KEEP=true; break; fi
+        done
+        if [ "$KEEP" = "false" ]; then
+          echo "nix-apple-container: removing stale image marker $mname"
+          rm -f "$marker"
+        fi
       done
-      if [ "$KEEP" = "false" ]; then
-        rm -f "$marker"
-      fi
-    done
+    fi
   '';
 
   mkContainerRunScript = name: c:
     let
+      allLabels = c.labels // { "managed-by" = "nix-apple-container"; };
       args = [ bin "run" "--name" name ]
         ++ lib.optionals (c.entrypoint != null) [ "--entrypoint" c.entrypoint ]
         ++ lib.optionals (c.user != null) [ "--user" c.user ]
@@ -188,7 +208,7 @@ let
         ++ (lib.concatMap (e: [ "--env" e ])
           (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
         ++ (lib.concatMap (l: [ "--label" l ])
-          (lib.mapAttrsToList (k: v: "${k}=${v}") c.labels))
+          (lib.mapAttrsToList (k: v: "${k}=${v}") allLabels))
         ++ (lib.concatMap (v: [ "--volume" v ]) c.volumes)
         ++ c.extraArgs
         ++ [ c.image ]
@@ -280,15 +300,17 @@ in {
         default = "stopped";
         description = ''
           Container cleanup strategy during gc.
-          - "none": don't touch containers
-          - "stopped": remove stopped containers not in config
-          - "running": stop and remove containers not in config
+          - "none": don't prune containers
+          - "stopped": run 'container prune' to remove all stopped containers
+          - "running": stop and remove containers not in config, then prune stopped
+          Note: containers removed from config are always cleaned up during
+          reconciliation in postActivation, regardless of this setting.
         '';
       };
       pruneImages = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Remove unused images during gc.";
+        description = "Remove dangling (untagged) images during gc. Does not remove tagged or in-use images.";
       };
     };
   };
@@ -302,6 +324,20 @@ in {
 
         if [ -d "$APP_SUPPORT" ]; then
           echo "nix-apple-container: tearing down..."
+
+          # Unload all module-owned launchd agents before stopping containers,
+          # otherwise KeepAlive=true restarts them immediately.
+          CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
+          AGENT_DIR="$CONTAINER_HOME/Library/LaunchAgents"
+          if [ -n "$CONTAINER_UID" ] && [ -d "$AGENT_DIR" ]; then
+            for plist in "$AGENT_DIR"/dev.apple.container.*.plist; do
+              [ -f "$plist" ] || continue
+              agent_name="$(basename "$plist" .plist)"
+              echo "nix-apple-container: unloading agent $agent_name..."
+              launchctl asuser "$CONTAINER_UID" sudo --user="${cfg.user}" -- launchctl unload "$plist" 2>/dev/null || true
+              sudo --user="${cfg.user}" -- rm -f "$plist"
+            done
+          fi
 
           ${runAs} ${bin} system stop 2>/dev/null || true
 
@@ -323,7 +359,14 @@ in {
             sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
         fi
 
-        rm -rf /var/lib/nix-apple-container
+        # Remove builder files if they exist
+        rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
+        rm -f /etc/nix/nix.custom.conf
+        rm -f /etc/nix/machines
+        rm -f /etc/ssh/ssh_config.d/200-nix-builder.conf
+
+        # Remove module state
+        rm -rf "${stateDir}"
       '';
     })
 
@@ -339,9 +382,9 @@ in {
             RunAtLoad = true;
             KeepAlive = true;
             StandardOutPath =
-              "/Users/${cfg.user}/Library/Logs/container-${name}.log";
+              "${userHome}/Library/Logs/container-${name}.log";
             StandardErrorPath =
-              "/Users/${cfg.user}/Library/Logs/container-${name}.err";
+              "${userHome}/Library/Logs/container-${name}.err";
           };
         }) autoStartContainers;
 
@@ -350,20 +393,25 @@ in {
       system.activationScripts.preActivation.text = lib.mkAfter
         (lib.concatStrings [
           ''
+            mkdir -p "${stateDir}"
             if ! ${runAs} ${bin} system status &>/dev/null; then
               echo "nix-apple-container: starting runtime..."
-              ${runAs} ${bin} system start --disable-kernel-install 2>/dev/null || true
+              ${runAs} ${bin} system start --disable-kernel-install
             fi
-            KERNEL_DIR="$(eval echo "~${cfg.user}")/Library/Application Support/com.apple.container/kernels"
-            if [ ! -d "$KERNEL_DIR" ] || [ -z "$(ls -A "$KERNEL_DIR" 2>/dev/null)" ]; then
+            KERNEL_DIR="${userHome}/Library/Application Support/com.apple.container/kernels"
+            KERNEL_ID="${kernelIdentity}"
+            if [ ! -d "$KERNEL_DIR" ] || [ -z "$(ls -A "$KERNEL_DIR" 2>/dev/null)" ] || \
+               [ "$(cat "${kernelIdentityFile}" 2>/dev/null)" != "$KERNEL_ID" ]; then
               echo "nix-apple-container: installing kernel..."
               ${runAs} ${bin} system kernel set \
                 --tar ${cfg.kernel.package} \
                 --binary ${cfg.kernel.binaryPath} \
-                --force 2>/dev/null || true
+                --force
+              echo "$KERNEL_ID" > "${kernelIdentityFile}"
             fi
           ''
           imageLoadScript
+          imageMarkerCleanupScript
           mkMountDirsScript
           (lib.optionalString cfg.gc.automatic gcScript)
         ]);
@@ -396,6 +444,8 @@ in {
             done
             if [ "$KEEP" = "false" ]; then
               echo "nix-apple-container: unloading stale agent $agent_name..."
+              # Note: 'launchctl unload' is legacy but still works on macOS 15+ and
+              # matches nix-darwin's own approach. Modern alternative: 'launchctl bootout'.
               launchctl asuser "$CONTAINER_UID" sudo --user="$CONTAINER_USER" -- launchctl unload "$plist" 2>/dev/null || true
               sudo --user="$CONTAINER_USER" -- rm -f "$plist"
             fi
@@ -418,7 +468,7 @@ in {
       );
     })
 
-    # Linux builder cleanup
+    # Linux builder cleanup (module enabled but builder disabled)
     (lib.mkIf (cfg.enable && !cfg.linuxBuilder.enable) {
       system.activationScripts.postActivation.text = lib.mkAfter ''
         if [ -f /etc/nix/builder_ed25519 ]; then
@@ -427,11 +477,14 @@ in {
           rm -f /etc/nix/nix.custom.conf
           rm -f /etc/nix/machines
           rm -f /etc/ssh/ssh_config.d/200-nix-builder.conf
+          # Restart daemon to pick up removed builder config
+          launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || \
+            launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
         fi
       '';
     })
 
-    # Linux builder
+    # Linux builder — container, SSH key, and SSH config (all backends)
     (lib.mkIf (cfg.enable && cfg.linuxBuilder.enable) {
       services.containerization.containers.nix-builder = {
         image = cfg.linuxBuilder.image;
@@ -457,26 +510,68 @@ in {
           sleep 1
         done
 
-        # SSH config to skip host key checking for the builder (localhost only)
+        # Idempotent file write helper — only writes when content changes
+        _builder_write() {
+          local target="$1" content="$2"
+          if [ ! -f "$target" ] || [ "$(cat "$target" 2>/dev/null)" != "$content" ]; then
+            printf '%s\n' "$content" > "$target"
+            return 0
+          fi
+          return 1
+        }
+
+        # SSH config for builder alias (port mapping + host key skipping).
+        # nix.buildMachines has no port field, so we use hostName=nix-builder as an
+        # SSH alias. StrictHostKeyChecking=no is needed because the builder generates
+        # a new host key on every container restart.
         mkdir -p /etc/ssh/ssh_config.d
-        printf '%s\n' \
-          'Host nix-builder' \
-          '  HostName localhost' \
-          '  Port ${toString cfg.linuxBuilder.sshPort}' \
-          '  User root' \
-          '  IdentityFile /etc/nix/builder_ed25519' \
-          '  StrictHostKeyChecking no' \
-          '  UserKnownHostsFile /dev/null' \
-          > /etc/ssh/ssh_config.d/200-nix-builder.conf
+        _builder_write /etc/ssh/ssh_config.d/200-nix-builder.conf \
+          "$(printf '%s\n' \
+            'Host nix-builder' \
+            '  HostName localhost' \
+            '  Port ${toString cfg.linuxBuilder.sshPort}' \
+            '  User root' \
+            '  IdentityFile /etc/nix/builder_ed25519' \
+            '  StrictHostKeyChecking no' \
+            '  UserKnownHostsFile /dev/null')" || true
+      '';
+    })
 
-        # Configure builder in nix.custom.conf (Determinate Nix)
-        printf '%s\n' 'builders = @/etc/nix/machines' 'builders-use-substitutes = true' > /etc/nix/nix.custom.conf
+    # Linux builder — declarative Nix config (plain nix-darwin with nix.enable = true)
+    (lib.mkIf (cfg.enable && cfg.linuxBuilder.enable && config.nix.enable) {
+      nix.buildMachines = [{
+        hostName = "nix-builder";
+        protocol = "ssh";
+        sshUser = "root";
+        sshKey = "/etc/nix/builder_ed25519";
+        systems = [ "aarch64-linux" ];
+        maxJobs = cfg.linuxBuilder.maxJobs;
+        speedFactor = 1;
+        supportedFeatures = [ "big-parallel" ];
+      }];
+      nix.distributedBuilds = true;
+      nix.settings.builders-use-substitutes = true;
+    })
 
-        echo "ssh://nix-builder aarch64-linux /etc/nix/builder_ed25519 ${toString cfg.linuxBuilder.maxJobs} 1 big-parallel - -" > /etc/nix/machines
+    # Linux builder — imperative fallback (nix.enable = false, e.g. Determinate Nix)
+    (lib.mkIf (cfg.enable && cfg.linuxBuilder.enable && !config.nix.enable) {
+      system.activationScripts.postActivation.text = lib.mkAfter ''
+        BUILDER_CHANGED=false
 
-        # Restart Nix daemon to pick up config changes
-        launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || \
-          launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
+        _builder_write /etc/nix/nix.custom.conf \
+          "$(printf '%s\n' 'builders = @/etc/nix/machines' 'builders-use-substitutes = true')" \
+          && BUILDER_CHANGED=true
+
+        _builder_write /etc/nix/machines \
+          "ssh://nix-builder aarch64-linux /etc/nix/builder_ed25519 ${toString cfg.linuxBuilder.maxJobs} 1 big-parallel - -" \
+          && BUILDER_CHANGED=true
+
+        # Only restart Nix daemon if config files actually changed
+        if [ "$BUILDER_CHANGED" = "true" ]; then
+          echo "nix-apple-container: builder config changed, restarting Nix daemon..."
+          launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || \
+            launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
+        fi
       '';
     })
   ];

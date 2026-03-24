@@ -99,11 +99,11 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 |--------|------|---------|-------------|
 | `automatic` | bool | `false` | Run garbage collection on activation |
 | `pruneContainers` | enum | `"stopped"` | `"none"`, `"stopped"`, or `"running"` |
-| `pruneImages` | bool | `false` | Remove unused images |
+| `pruneImages` | bool | `false` | Remove dangling (untagged) images |
 
 `pruneContainers` strategies:
-- `"none"` — don't touch containers
-- `"stopped"` — remove stopped containers
+- `"none"` — don't prune containers
+- `"stopped"` — run `container prune` (removes all stopped containers)
 - `"running"` — stop and remove containers not declared in config, then prune stopped
 
 > Note: Containers removed from config are always stopped and cleaned up on rebuild, regardless of GC settings. The GC options control cleanup of ad-hoc containers created outside your Nix config.
@@ -123,7 +123,7 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 | `sshPort` | port | `31022` | Host port for SSH to the builder |
 | `maxJobs` | int | `4` | Max parallel build jobs |
 
-Runs a Nix builder container for aarch64-linux builds. Uses a known SSH key pair (builder only listens on localhost). Writes to `/etc/nix/nix.custom.conf` (Determinate Nix compatible).
+Runs a Nix builder container for aarch64-linux builds. Uses a known SSH key pair (builder only listens on localhost). When `nix.enable = true`, configures the builder declaratively via `nix.buildMachines` and `nix.distributedBuilds`. When `nix.enable = false` (e.g. Determinate Nix), writes idempotently to `/etc/nix/nix.custom.conf` and `/etc/nix/machines`, only restarting the daemon when config changes.
 
 **Bootstrap**: First rebuild starts the builder. Second rebuild can use it for Linux derivations (e.g. nix2container images with `aarch64-linux` packages).
 
@@ -247,12 +247,14 @@ Images are only re-loaded when their content changes (tracked via Nix store path
 
 Set `enable = false` and rebuild. The module will:
 
-1. Stop the container runtime
-2. Remove kernels and API server state (cheap to reinstall from Nix store)
-3. Clear user preference defaults and `.pkg` install receipts
-4. Launchd agents are removed automatically by nix-darwin
+1. Unload all container launchd agents
+2. Stop the container runtime
+3. Remove kernels and API server state (cheap to reinstall from Nix store)
+4. Remove builder configuration files (`/etc/nix/builder_ed25519*`, `/etc/nix/machines`, `/etc/nix/nix.custom.conf`, `/etc/ssh/ssh_config.d/200-nix-builder.conf`) if present
+5. Remove module state (`/var/lib/nix-apple-container`)
+6. Clear user preference defaults and `.pkg` install receipts
 
-Pulled images are preserved by default. Set `teardown.removeImages = true` to remove everything.
+Pulled images are preserved by default. Set `teardown.removeImages = true` to also remove all image data.
 
 If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import. If you find any lingering artifacts please open an issue.
 
