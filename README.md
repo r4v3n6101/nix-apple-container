@@ -6,16 +6,14 @@ A nix-darwin module for declaratively managing [Apple Containerization](https://
 
 ## What it does
 
-- Packages the `container` CLI from Apple's `.pkg` release via Nix (no Homebrew needed)
-- Manages the Linux kernel as a Nix derivation (no runtime download from GitHub)
+- Packages the `container` CLI from Apple's `.pkg` release via Nix
+- Manages the Kata Linux kernel as a Nix derivation (no runtime download from GitHub)
 - Starts the container runtime and installs the kernel automatically
 - Declares containers that run as launchd user agents (automatically recreated on config change)
 - Auto-creates host directories for volume mounts
 - Optional Linux builder container for building `aarch64-linux` derivations on macOS
 - Reconciles running containers against config — removes undeclared containers and their launchd agents
-- Garbage-collects containers and images not in your config
-- Loads Nix-built OCI images via [nix2container](https://github.com/nlewo/nix2container) — no tarballs in the Nix store
-- Selective teardown when disabled — optionally preserves pulled images across disable/enable cycles
+- Builds and loads Nix-built OCI images via [nix2container](https://github.com/nlewo/nix2container) — no tarballs in the Nix store
 
 ## Requirements
 
@@ -256,8 +254,5 @@ Set `enable = false` and rebuild. The module will:
 
 Pulled images are preserved by default. Set `teardown.removeImages = true` to remove everything.
 
-If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import.
+If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import. If you find any lingering artifacts please open an issue.
 
-## License
-
-Apache-2.0
