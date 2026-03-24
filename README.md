@@ -10,8 +10,8 @@ A nix-darwin module for declaratively managing [Apple Containerization](https://
 - Manages the Linux kernel as a Nix derivation (no runtime download from GitHub)
 - Starts the container runtime and installs the kernel automatically
 - Declares containers that run as launchd user agents (automatically recreated on config change)
-- Loads Nix-built OCI images (via `dockerTools`) into the runtime on activation
 - Auto-creates host directories for volume mounts
+- Optional Linux builder container for building `aarch64-linux` derivations on macOS
 - Reconciles running containers against config — removes undeclared containers and their launchd agents
 - Garbage-collects containers and images not in your config
 - Selective teardown when disabled — optionally preserves pulled images across disable/enable cycles
@@ -93,13 +93,6 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 | `pull` | enum | `"missing"` | `"missing"`, `"always"`, or `"never"` — image pull policy |
 | `extraArgs` | list of strings | `[]` | Extra arguments passed to `container run` (e.g. `--publish`, `--cpus`, `--memory`) |
 
-### `services.containerization.images.<name>`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `image` | package | *required* | OCI image derivation (e.g. `dockerTools.buildLayeredImage`) |
-| `autoLoad` | bool | `true` | Load into the runtime on activation |
-
 ### `services.containerization.gc`
 
 | Option | Type | Default | Description |
@@ -120,6 +113,19 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `removeImages` | bool | `false` | Remove pulled images when disabling. If false, images survive disable/enable cycles |
+
+### `services.containerization.linuxBuilder`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | `false` | Run a Nix builder container for aarch64-linux builds |
+| `image` | string | `"ghcr.io/halfwhey/nix-builder:latest"` | Builder container image |
+| `sshPort` | port | `31022` | Host port for SSH to the builder |
+| `maxJobs` | int | `4` | Max parallel build jobs |
+
+Runs a Nix builder container for aarch64-linux builds. Uses a known SSH key pair (builder only listens on localhost). Writes to `/etc/nix/nix.custom.conf` (Determinate Nix compatible).
+
+**Bootstrap**: First rebuild starts the builder. Second rebuild can use it for Linux derivations (e.g. `dockerTools.buildImage`).
 
 ## Examples
 
@@ -159,28 +165,6 @@ services.containerization = {
     ];
   };
 };
-```
-
-### Nix-built OCI image
-
-```nix
-# Container images need Linux packages, not macOS packages
-{ pkgs, ... }:
-let
-  pkgsLinux = import pkgs.path { system = "aarch64-linux"; };
-in {
-  services.containerization = {
-    enable = true;
-
-    images.hello = {
-      image = pkgsLinux.dockerTools.buildImage {
-        name = "hello";
-        tag = "latest";
-        config.Cmd = [ "${pkgsLinux.hello}/bin/hello" ];
-      };
-    };
-  };
-}
 ```
 
 ### Aggressive garbage collection

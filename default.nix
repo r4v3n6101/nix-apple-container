@@ -5,22 +5,6 @@ let
   bin = lib.getExe cfg.package;
   runAs = "sudo -u ${cfg.user} --";
 
-  imageSubmodule = lib.types.submodule {
-    options = {
-      image = lib.mkOption {
-        type = lib.types.package;
-        description =
-          "OCI image derivation (e.g. from dockerTools.buildLayeredImage).";
-      };
-      autoLoad = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description =
-          "Load this image into the container runtime on activation.";
-      };
-    };
-  };
-
   containerSubmodule = lib.types.submodule {
     options = {
       image = lib.mkOption {
@@ -110,7 +94,6 @@ let
     };
   };
 
-  autoLoadImages = lib.filterAttrs (_: i: i.autoLoad) cfg.images;
   autoStartContainers = lib.filterAttrs (_: c: c.autoStart) cfg.containers;
 
   # Extract host paths from volume strings (host:container) for containers with autoCreateMounts
@@ -127,11 +110,6 @@ let
       ) c.volumes
     )
   ) cfg.containers);
-
-  imageLoadScript = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: img: ''
-    echo "nix-apple-container: loading image ${name}..."
-    ${runAs} ${bin} image load < ${img.image}
-  '') autoLoadImages);
 
   declaredContainerNames =
     lib.concatStringsSep " " (lib.attrNames cfg.containers);
@@ -207,12 +185,6 @@ in {
       description = "The container CLI package.";
     };
 
-    images = lib.mkOption {
-      type = lib.types.attrsOf imageSubmodule;
-      default = { };
-      description = "Nix-built OCI images to load into the container runtime.";
-    };
-
     containers = lib.mkOption {
       type = lib.types.attrsOf containerSubmodule;
       default = { };
@@ -229,6 +201,25 @@ in {
         type = lib.types.str;
         default = "opt/kata/share/kata-containers/vmlinux-6.18.5-177";
         description = "Path to the kernel binary within the tar archive.";
+      };
+    };
+
+    linuxBuilder = {
+      enable = lib.mkEnableOption "Linux builder container for aarch64-linux builds";
+      image = lib.mkOption {
+        type = lib.types.str;
+        default = "ghcr.io/halfwhey/nix-builder:latest";
+        description = "Docker image for the Nix remote builder.";
+      };
+      sshPort = lib.mkOption {
+        type = lib.types.port;
+        default = 31022;
+        description = "Host port for SSH to the builder container.";
+      };
+      maxJobs = lib.mkOption {
+        type = lib.types.int;
+        default = 4;
+        description = "Maximum number of parallel build jobs on the builder.";
       };
     };
 
@@ -280,11 +271,11 @@ in {
           # API server plist is regenerated on system start
           rm -rf "$APP_SUPPORT/apiserver"
 
-          if [ "${lib.boolToString cfg.teardown.removeImages}" = "true" ]; then
+          ${lib.optionalString cfg.teardown.removeImages ''
             echo "nix-apple-container: removing images..."
             rm -rf "$APP_SUPPORT/content"
             rm -rf "$APP_SUPPORT"
-          fi
+          ''}
 
           ${runAs} defaults delete com.apple.container 2>/dev/null || true
 
@@ -381,11 +372,69 @@ in {
             fi
           done
         ''
-        + lib.optionalString (autoLoadImages != { }) ''
-          echo "nix-apple-container: loading images..."
-          ${imageLoadScript}
-        ''
       );
+    })
+
+    # Linux builder cleanup
+    (lib.mkIf (cfg.enable && !cfg.linuxBuilder.enable) {
+      system.activationScripts.postActivation.text = lib.mkAfter ''
+        if [ -f /etc/nix/builder_ed25519 ]; then
+          echo "nix-apple-container: removing linux builder resources..."
+          rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
+          rm -f /etc/nix/nix.custom.conf
+          rm -f /etc/nix/machines
+          rm -f /etc/ssh/ssh_config.d/200-nix-builder.conf
+        fi
+      '';
+    })
+
+    # Linux builder
+    (lib.mkIf (cfg.enable && cfg.linuxBuilder.enable) {
+      services.containerization.containers.nix-builder = {
+        image = cfg.linuxBuilder.image;
+        autoStart = true;
+        extraArgs = [
+          "--publish" "${toString cfg.linuxBuilder.sshPort}:22"
+        ];
+      };
+
+      system.activationScripts.preActivation.text = lib.mkAfter ''
+        install -m 600 ${./builder/builder_ed25519} /etc/nix/builder_ed25519
+        install -m 644 ${./builder/builder_ed25519.pub} /etc/nix/builder_ed25519.pub
+      '';
+
+      system.activationScripts.postActivation.text = lib.mkAfter ''
+        echo "nix-apple-container: waiting for linux builder..."
+        for _i in $(seq 1 30); do
+          if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+               -i /etc/nix/builder_ed25519 -p ${toString cfg.linuxBuilder.sshPort} \
+               root@localhost true 2>/dev/null; then
+            break
+          fi
+          sleep 1
+        done
+
+        # SSH config to skip host key checking for the builder (localhost only)
+        mkdir -p /etc/ssh/ssh_config.d
+        printf '%s\n' \
+          'Host nix-builder' \
+          '  HostName localhost' \
+          '  Port ${toString cfg.linuxBuilder.sshPort}' \
+          '  User root' \
+          '  IdentityFile /etc/nix/builder_ed25519' \
+          '  StrictHostKeyChecking no' \
+          '  UserKnownHostsFile /dev/null' \
+          > /etc/ssh/ssh_config.d/200-nix-builder.conf
+
+        # Configure builder in nix.custom.conf (Determinate Nix)
+        printf '%s\n' 'builders = @/etc/nix/machines' 'builders-use-substitutes = true' > /etc/nix/nix.custom.conf
+
+        echo "ssh://nix-builder aarch64-linux /etc/nix/builder_ed25519 ${toString cfg.linuxBuilder.maxJobs} 1 big-parallel - -" > /etc/nix/machines
+
+        # Restart Nix daemon to pick up config changes
+        launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || \
+          launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
+      '';
     })
   ];
 }
