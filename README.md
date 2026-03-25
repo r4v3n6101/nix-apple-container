@@ -137,7 +137,20 @@ After `darwin-rebuild switch`, the container runtime starts, the image is pulled
 
 Runs a Nix builder container for aarch64-linux builds. The default image (`ghcr.io/halfwhey/nix-builder`) is built from the `builder/Dockerfile` in this repo — it's a minimal `nixos/nix` image with sshd. Uses a known SSH key pair (builder only listens on localhost, same security model as nixpkgs' `darwin.linux-builder`).
 
-When `nix.enable = true`, configures the builder declaratively via `nix.buildMachines` and `nix.distributedBuilds`. When `nix.enable = false` (e.g. Determinate Nix), writes idempotently to `/etc/nix/nix.custom.conf` and `/etc/nix/machines`, only restarting the daemon when config changes.
+Builder Nix configuration is fully declarative:
+- **`nix.enable = true`** (plain nix-darwin): uses `nix.buildMachines`, `nix.distributedBuilds`, and `nix.settings`.
+- **Determinate Nix**: uses `determinateNix.customSettings`. Requires the [Determinate nix-darwin module](https://docs.determinate.systems/guides/nix-darwin/) — add the input and module to your flake:
+
+  ```nix
+  # flake inputs
+  determinate.url = "https://flakehub.com/f/DeterminateSystems/determinate/3";
+
+  # darwinSystem modules list
+  inputs.determinate.darwinModules.default
+
+  # darwin config
+  determinateNix.enable = true;
+  ```
 
 **Bootstrap**: First rebuild starts the builder. Second rebuild can use it for Linux derivations (e.g. nix2container images with `aarch64-linux` packages).
 

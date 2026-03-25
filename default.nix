@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, options, ... }:
 
 let
   cfg = config.services.containerization;
@@ -359,11 +359,8 @@ in {
             sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
         fi
 
-        # Remove builder files if they exist
+        # Remove builder SSH key if it exists
         rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
-        rm -f /etc/nix/nix.custom.conf
-        rm -f /etc/nix/machines
-        rm -f /etc/ssh/ssh_config.d/200-nix-builder.conf
 
         # Remove module state
         rm -rf "${stateDir}"
@@ -474,12 +471,6 @@ in {
         if [ -f /etc/nix/builder_ed25519 ]; then
           echo "nix-apple-container: removing linux builder resources..."
           rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
-          rm -f /etc/nix/nix.custom.conf
-          rm -f /etc/nix/machines
-          rm -f /etc/ssh/ssh_config.d/200-nix-builder.conf
-          # Restart daemon to pick up removed builder config
-          launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || \
-            launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
         fi
       '';
     })
@@ -494,9 +485,24 @@ in {
         ];
       };
 
+      # SSH key must be imperative — SSH requires 0600, can't use a world-readable store path
       system.activationScripts.preActivation.text = lib.mkAfter ''
         install -m 600 ${./builder/builder_ed25519} /etc/nix/builder_ed25519
         install -m 644 ${./builder/builder_ed25519.pub} /etc/nix/builder_ed25519.pub
+      '';
+
+      # SSH config for builder alias (port mapping + host key skipping).
+      # nix.buildMachines has no port field, so we use hostName=nix-builder as an
+      # SSH alias. StrictHostKeyChecking=no is needed because the builder generates
+      # a new host key on every container restart.
+      programs.ssh.extraConfig = ''
+        Host nix-builder
+          HostName localhost
+          Port ${toString cfg.linuxBuilder.sshPort}
+          User root
+          IdentityFile /etc/nix/builder_ed25519
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
       '';
 
       system.activationScripts.postActivation.text = lib.mkAfter ''
@@ -509,31 +515,6 @@ in {
           fi
           sleep 1
         done
-
-        # Idempotent file write helper — only writes when content changes
-        _builder_write() {
-          local target="$1" content="$2"
-          if [ ! -f "$target" ] || [ "$(cat "$target" 2>/dev/null)" != "$content" ]; then
-            printf '%s\n' "$content" > "$target"
-            return 0
-          fi
-          return 1
-        }
-
-        # SSH config for builder alias (port mapping + host key skipping).
-        # nix.buildMachines has no port field, so we use hostName=nix-builder as an
-        # SSH alias. StrictHostKeyChecking=no is needed because the builder generates
-        # a new host key on every container restart.
-        mkdir -p /etc/ssh/ssh_config.d
-        _builder_write /etc/ssh/ssh_config.d/200-nix-builder.conf \
-          "$(printf '%s\n' \
-            'Host nix-builder' \
-            '  HostName localhost' \
-            '  Port ${toString cfg.linuxBuilder.sshPort}' \
-            '  User root' \
-            '  IdentityFile /etc/nix/builder_ed25519' \
-            '  StrictHostKeyChecking no' \
-            '  UserKnownHostsFile /dev/null')" || true
       '';
     })
 
@@ -553,26 +534,18 @@ in {
       nix.settings.builders-use-substitutes = true;
     })
 
-    # Linux builder — imperative fallback (nix.enable = false, e.g. Determinate Nix)
-    (lib.mkIf (cfg.enable && cfg.linuxBuilder.enable && !config.nix.enable) {
-      system.activationScripts.postActivation.text = lib.mkAfter ''
-        BUILDER_CHANGED=false
-
-        _builder_write /etc/nix/nix.custom.conf \
-          "$(printf '%s\n' 'builders = @/etc/nix/machines' 'builders-use-substitutes = true')" \
-          && BUILDER_CHANGED=true
-
-        _builder_write /etc/nix/machines \
-          "ssh://nix-builder aarch64-linux /etc/nix/builder_ed25519 ${toString cfg.linuxBuilder.maxJobs} 1 big-parallel - -" \
-          && BUILDER_CHANGED=true
-
-        # Only restart Nix daemon if config files actually changed
-        if [ "$BUILDER_CHANGED" = "true" ]; then
-          echo "nix-apple-container: builder config changed, restarting Nix daemon..."
-          launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null || \
-            launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null || true
-        fi
-      '';
-    })
+    # Linux builder — Determinate Nix config (nix.enable = false, determinateNix module available)
+    (lib.mkIf (cfg.enable && cfg.linuxBuilder.enable && !config.nix.enable) (
+      if options ? determinateNix then {
+        determinateNix.customSettings = {
+          builders = "ssh://nix-builder aarch64-linux /etc/nix/builder_ed25519 ${toString cfg.linuxBuilder.maxJobs} 1 big-parallel - -";
+          builders-use-substitutes = true;
+        };
+      } else {
+        warnings = [
+          "nix-apple-container: linuxBuilder.enable is true but neither nix.enable nor the determinateNix module is available. Builder Nix config (buildMachines, distributedBuilds) must be managed manually."
+        ];
+      }
+    ))
   ];
 }
