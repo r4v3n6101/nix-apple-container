@@ -9,7 +9,7 @@ This is a nix-darwin module that wraps Apple's [Containerization](https://github
 - `default.nix` — the nix-darwin module
 - `package.nix` — derivation that extracts the `container` CLI from Apple's signed `.pkg`
 - `kernel.nix` — fetchurl derivation for the kata-containers kernel tarball
-- `builder_ed25519` / `builder_ed25519.pub` — known SSH key pair for the linux builder (intentionally public, same model as nixpkgs' `darwin.linux-builder`)
+- `builder/builder_ed25519` / `builder/builder_ed25519.pub` — known SSH key pair for the linux builder (intentionally public, same model as nixpkgs' `darwin.linux-builder`)
 
 The flake exposes `darwinModules.default`, `packages.aarch64-darwin.default`, and `packages.aarch64-darwin.kernel`.
 
@@ -31,7 +31,7 @@ The `.pkg` does NOT extract to `usr/local/` — files are at the root of the pay
 nix-darwin activation order: `preActivation` → `launchd` → `userLaunchd` → `postActivation`.
 
 The module uses:
-- `preActivation`: runtime start, kernel install, image loading, stale image marker cleanup, mount dir creation, GC
+- `preActivation`: runtime start, kernel install, image loading (nix2container), mount dir creation, container pruning
 - Main activation (nix-darwin): loads/unloads launchd agents (starts/stops containers)
 - `postActivation`: reconcile stale agents, stop undeclared containers, builder SSH setup
 
@@ -41,10 +41,9 @@ The module uses:
 1. Creates module state directory (`/var/lib/nix-apple-container`)
 2. `container system status` — check if runtime is running; only start if not (fails loudly on error, no `|| true`)
 3. Kernel identity tracking — installs kernel if kernels dir is empty OR if `${kernelIdentity}` marker differs from stored value. This ensures kernel changes in config are applied (not just first-time install). Marker stored at `/var/lib/nix-apple-container/kernel-identity`.
-4. Loads nix2container images if any declared in `images.*` (must happen before launchd starts containers). Each load runs in a subshell with `set -e` and `trap` for temp file cleanup.
-5. Cleans stale image markers (always runs, even when `images = {}`)
-6. Creates mount directories for containers with `autoCreateMounts = true` (only for absolute host paths)
-7. Runs GC if `gc.automatic = true`
+4. Image loading — for each image in `images.*`, checks if it's already present via `container image ls`, and loads it via `container image load -i` if missing. Must happen before launchd starts containers.
+5. Creates mount directories for containers with `autoCreateMounts = true` (only for absolute host paths)
+6. Prunes stopped containers (`container prune`)
 
 `postActivation`:
 1. Unloads stale launchd agents (`dev.apple.container.*.plist`) not in current config
@@ -59,8 +58,7 @@ Declared as `launchd.user.agents` (NOT `launchd.daemons`). This is critical beca
 
 Each container's `ProgramArguments` points to a wrapper script (`mkContainerRunScript`) that:
 1. Stops and removes any existing container with the same name
-2. Optionally pulls the image (if `pull = "always"`)
-3. `exec container run ...` with all configured flags
+2. `exec container run ...` with all configured flags
 
 This wrapper ensures config changes are applied cleanly — when the plist changes, nix-darwin reloads the agent, the new wrapper cleans up the old container VM, and starts fresh. The `--detach` flag is NOT used because launchd manages the process lifecycle.
 
@@ -71,13 +69,11 @@ Guarded by `if [ -d "$APP_SUPPORT" ]` — only runs if container state exists (p
 When disabled:
 1. Unloads all module-owned launchd agents (`dev.apple.container.*.plist`) — runs before system stop to prevent KeepAlive restart loops
 2. `container system stop` — deregisters launchd services, stops containers
-3. Removes `$APP_SUPPORT/kernels` (cheap to reinstall from Nix store)
-4. Removes `$APP_SUPPORT/apiserver` (regenerated on system start)
-5. If `teardown.removeImages = true`: removes `$APP_SUPPORT/content` and the entire directory
-6. `defaults delete com.apple.container`
-7. `pkgutil --forget com.apple.container-installer` (if receipt exists)
-8. Removes builder files (`/etc/nix/builder_ed25519*`, `/etc/nix/nix.custom.conf`, `/etc/nix/machines`, `/etc/ssh/ssh_config.d/200-nix-builder.conf`) if present
-9. Removes module state directory (`/var/lib/nix-apple-container`)
+3. Removes entire `$APP_SUPPORT` directory (the runtime rebuilds it on next enable)
+4. `defaults delete com.apple.container`
+5. `pkgutil --forget com.apple.container-installer` (if receipt exists)
+6. Removes builder files (`/etc/nix/builder_ed25519*`) if present
+7. Removes module state directory (`/var/lib/nix-apple-container`)
 
 ### Linux builder (linuxBuilder.enable = true)
 
@@ -85,28 +81,28 @@ Runs `nixos/nix` as an Apple container with sshd, configured as a Nix remote bui
 
 Builder config uses backend-specific declarative options when possible:
 - When `config.nix.enable = true` (plain nix-darwin): sets `nix.buildMachines`, `nix.distributedBuilds`, `nix.settings.builders-use-substitutes` declaratively. nix-darwin writes the files and handles daemon restarts.
-- When `config.nix.enable = false` (Determinate Nix): writes idempotently to `/etc/nix/nix.custom.conf` and `/etc/nix/machines`. Only restarts the daemon when content changes.
-- In all backends: SSH key (`/etc/nix/builder_ed25519`) and SSH config (`/etc/ssh/ssh_config.d/200-nix-builder.conf`) are always managed imperatively but idempotently. SSH config is needed because `nix.buildMachines` has no port field (we use `hostName = "nix-builder"` as an SSH alias) and `StrictHostKeyChecking no` is required (builder generates a new host key on every restart).
+- When `config.nix.enable = false` (Determinate Nix): sets `determinateNix.customSettings` declaratively.
+- In all backends: SSH key (`/etc/nix/builder_ed25519`) is installed imperatively (needs 0600 perms). SSH config uses `programs.ssh.extraConfig` declaratively. SSH config is needed because `nix.buildMachines` has no port field (we use `hostName = "nix-builder"` as an SSH alias) and `StrictHostKeyChecking no` is required (builder generates a new host key on every restart).
 
-When disabled: removes `/etc/nix/builder_ed25519*`, `/etc/nix/nix.custom.conf`, `/etc/nix/machines`, `/etc/ssh/ssh_config.d/200-nix-builder.conf`. Container is removed by reconciliation. Declarative `nix.buildMachines` is cleared automatically by nix-darwin when the `lib.mkIf` condition becomes false.
+When disabled: removes `/etc/nix/builder_ed25519*`. Container is removed by reconciliation. Declarative `nix.buildMachines`, `programs.ssh.extraConfig`, and `determinateNix.customSettings` are cleared automatically by nix-darwin when the `lib.mkIf` condition becomes false.
 
-### nix2container images (images.*)
+### Images
 
-Loads OCI images built with nix2container into the container runtime at activation time. nix2container produces a tiny JSON metadata file — layers are streamed on-the-fly from Nix store paths via a patched skopeo, avoiding full tarballs in the store.
+Two image sources:
+- **`images.*`** (`attrsOf package`): nix2container `buildImage` or `pullImage`. Built at Nix eval time, loaded into the runtime via `container image load` at activation time.
+- **Registry images**: Containers referencing images not in `images.*` are pulled automatically by the container runtime when `container run` is invoked. No Nix-side fetch needed.
 
-Loading pipeline: `copyTo oci:<tmpdir>` → `tar -C $tmpdir -cf $tmpdir.tar .` → `container image load -i $tmpdir.tar` → cleanup. Each load runs in a subshell with `set -e` and `trap` for guaranteed temp file cleanup on failure.
+**Image loading**: nix2container images are exported to OCI layout dirs at build time (`resolvedImages`). At activation time, the module checks `container image ls` for each image and loads missing ones via `container image load -i <tarball>`. The tar is created from the OCI dir on the fly and deleted after loading. `container image load` handles all internal details (Image Index wrapping, blob storage, state.json updates).
 
-**Critical**: Image loading runs in `preActivation` (not postActivation) because launchd starts containers between pre and post. A container with `pull = "never"` needs its image present before it starts.
+**Critical**: Image loading runs in `preActivation` (not postActivation) because launchd starts containers between pre and post.
 
-**Idempotency**: Marker files at `/var/lib/nix-apple-container/images/<name>` store the `copyTo` store path. Image is only re-loaded when the store path changes (i.e., image content changed). Stale marker cleanup runs unconditionally (not gated on `images != {}`) so markers are cleaned up even when all images are removed from config.
-
-**Apple `container image load` only accepts OCI Image Layout tar archives** — NOT Docker tarballs. The `oci:` directory output + manual tar produces the correct format.
+**Idempotency**: The `container image ls | grep` check makes loading idempotent — images already present are skipped.
 
 ### Root vs user context
 
-`darwin-rebuild switch` runs activation scripts as root. All `container` CLI calls must use `sudo -u <user> --` to run as the actual user. The `user` option defaults to `config.system.primaryUser`.
+`darwin-rebuild switch` runs activation scripts as root. Container CLI calls in activation scripts use `sudo -u <user> --` (`runAs`) to run as the actual user. Launchd agent wrappers (`mkContainerRunScript`) run directly as the user since launchd.user.agents runs in the user session. The `user` option defaults to `config.system.primaryUser`.
 
-The teardown script resolves the user's home directory via `eval echo "~$CONTAINER_USER"` rather than relying on `$HOME` (which is `/var/root` during activation).
+The user's home directory is resolved at Nix eval time via `userHome` (checks `config.users.users` first, falls back to `/Users/${cfg.user}`).
 
 ## Idempotency and cleanup principles
 
@@ -127,10 +123,11 @@ Every feature that creates state outside the Nix store MUST clean it up when dis
 |-----------|--------------|----------------------|
 | Module (`enable`) | `~/Library/Application Support/com.apple.container/`, defaults, pkg receipt, `/var/lib/nix-apple-container/` | Teardown block with `!cfg.enable` guard; also removes builder files |
 | Containers (`autoStart`) | Launchd agents (`dev.apple.container.*.plist`), running container VMs | postActivation reconciliation unloads agents + stops/removes containers; teardown also unloads agents before system stop |
-| Linux builder (`linuxBuilder.enable`) | `/etc/nix/builder_ed25519*`, `/etc/ssh/ssh_config.d/200-nix-builder.conf`, `/etc/nix/nix.custom.conf` (imperative path only), `/etc/nix/machines` (imperative path only), `nix.buildMachines` (declarative path) | `!cfg.linuxBuilder.enable` block removes files + restarts daemon; declarative options cleared by nix-darwin |
+| Linux builder (`linuxBuilder.enable`) | `/etc/nix/builder_ed25519*`, `programs.ssh.extraConfig`, `nix.buildMachines` (declarative), `determinateNix.customSettings` (Determinate) | `!cfg.linuxBuilder.enable` block removes SSH key; declarative options cleared by nix-darwin |
 | Kernel | `/var/lib/nix-apple-container/kernel-identity` marker | Marker removed with state dir on `!cfg.enable` |
-| Images (`images.*`) | `/var/lib/nix-apple-container/images/` markers, loaded images in container store | Stale markers cleaned unconditionally; image data cleaned by `gc.pruneImages`; marker dir removed on `!cfg.enable` |
+| Images (`images.*`) | Images loaded into runtime's own storage via `container image load` | Runtime storage removed with `$APP_SUPPORT` on `!cfg.enable` |
 | Mount directories (`autoCreateMounts`) | Host directories for volumes (absolute paths only) | NOT cleaned up (user data, intentionally preserved) |
+| Unnamed volumes | Runtime-managed storage inside `$APP_SUPPORT` (volumes without a host path) | Destroyed with `$APP_SUPPORT` on `!cfg.enable` — a build-time warning is emitted |
 
 ### nix-darwin's `userLaunchd` limitation
 
@@ -142,16 +139,9 @@ Plist filenames are derived from `serviceConfig.Label`, NOT the nix-darwin attri
 
 ## Garbage collection
 
-`gc.pruneContainers` is an enum:
-- `"none"` — skip
-- `"stopped"` — `container prune` (removes all stopped containers)
-- `"running"` — lists all containers via `container ls --format json`, compares names against declared `containers.<name>` attrs, stops+removes undeclared ones, then prunes stopped
+Stopped containers are pruned unconditionally on every activation (`container prune`). Containers removed from config are stopped and removed during postActivation reconciliation.
 
-The `"running"` mode uses `jq` to parse the JSON output. The `jq` binary is referenced as `${pkgs.jq}/bin/jq` to avoid a runtime dependency.
-
-`gc.pruneImages` runs `container image prune` which removes **dangling** (untagged) images, not all unused images. The option description reflects this.
-
-Note: Containers removed from config are always stopped during postActivation reconciliation, regardless of GC settings. GC is for cleaning up ad-hoc containers created outside the Nix config.
+nix2container OCI layout dirs in the Nix store are referenced by the system profile's closure and protected from `nix-gc` as long as the current generation uses them. The runtime manages its own image storage independently.
 
 ## Bugs encountered during development
 

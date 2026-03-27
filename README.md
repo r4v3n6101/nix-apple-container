@@ -1,8 +1,16 @@
+<div align="center">
+
 # nix-apple-container
 
-> **Alpha** — this module is functional but under active development. Options may change.
+A nix-darwin module for declaratively managing [Apple Containerization][apple-containerization] — Apple's native Linux container runtime for Apple Silicon Macs.
 
-A nix-darwin module for declaratively managing [Apple Containerization](https://github.com/apple/containerization) — Apple's native Linux container runtime for Apple Silicon Macs.
+[What it does](#what-it-does) •
+[Getting started](#getting-started) •
+[Options][options] •
+[Examples](#examples) •
+[Uninstall](#uninstall)
+
+</div>
 
 ## What it does
 
@@ -14,15 +22,20 @@ A nix-darwin module for declaratively managing [Apple Containerization](https://
 - Auto-creates host directories for volume mounts
 - Optional Linux builder container for building `aarch64-linux` derivations on macOS
 - Reconciles running containers against config — removes undeclared containers and their launchd agents
-- Builds and loads Nix-built OCI images via [nix2container](https://github.com/nlewo/nix2container) — no tarballs in the Nix store
+- Builds and loads Nix-built OCI images via [nix2container][nix2container] — no tarballs in the Nix store
 
-## Requirements
+> **Runtime ownership**: This module fully owns the configured user's Apple container runtime. Undeclared containers are treated as drift and removed on rebuild. nix2container images are loaded via `container image load` at activation time; registry images are pulled by the runtime automatically when a container starts. Disabling the module tears down the runtime wholesale.
+
+## Getting started
+
+### Requirements
 
 - Apple Silicon Mac (aarch64-darwin)
 - macOS 15+ (macOS 26 required for volume mounts and full networking)
-- nix-darwin
+- [nix-darwin][nix-darwin]
 
-### Tested on
+<details>
+<summary>Tested on</summary>
 
 ```
 macOS: 26.3 (25D125)
@@ -33,7 +46,9 @@ nix-darwin: github:LnL7/nix-darwin/da529ac (2026-03-08)
 nixpkgs: github:nixos/nixpkgs/e802360 (2026-03-14)
 ```
 
-## Usage
+</details>
+
+### Installation
 
 Add the flake input:
 
@@ -64,95 +79,11 @@ Import the module in your darwin host config:
 }
 ```
 
-After `darwin-rebuild switch`, the container runtime starts, the image is pulled, and the container runs as a launchd user agent. Changing any container option (image, env, volumes, ports) and rebuilding will automatically stop the old container and start a fresh one with the new config.
+After `darwin-rebuild switch`, the container runtime starts, the image is pulled from the registry, and the container runs as a launchd user agent. Changing any container option (image, env, volumes, ports) and rebuilding will automatically stop the old container and start a fresh one with the new config.
 
 ## Options
 
-### `services.containerization`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable` | bool | `false` | Install the CLI, start the runtime, enable the module |
-| `user` | string | `config.system.primaryUser` | User to run container commands as (activation scripts run as root) |
-| `package` | package | *built from .pkg* | Override the container CLI package |
-| `images` | attrs of packages | `{}` | nix2container images to load (see [Nix-built images](#nix-built-images-with-nix2container)) |
-
-### `services.containerization.kernel`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `package` | package | *kata 3.26.0 arm64* | Kata kernel tarball — lives in Nix store, survives teardown |
-| `binaryPath` | string | `"opt/kata/share/..."` | Path to the kernel binary within the tar archive |
-
-### `services.containerization.containers.<name>`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `image` | string | *required* | Image name:tag (pulled from registry if not local) |
-| `autoStart` | bool | `false` | Run via launchd user agent on login |
-| `cmd` | list of strings | `[]` | Override the image CMD |
-| `env` | attrs of strings | `{}` | Environment variables |
-| `volumes` | list of strings | `[]` | Volume mounts (`host-path:container-path`, macOS 26+) |
-| `autoCreateMounts` | bool | `true` | Create host directories for volume mounts if they don't exist |
-| `entrypoint` | string or null | `null` | Override the image entrypoint |
-| `user` | string or null | `null` | Run as UID or UID:GID |
-| `workdir` | string or null | `null` | Override working directory |
-| `init` | bool | `false` | Run init for signal forwarding and zombie reaping |
-| `ssh` | bool | `false` | Forward SSH agent from host |
-| `network` | string or null | `null` | Attach to custom network (macOS 26+) |
-| `readOnly` | bool | `false` | Read-only root filesystem |
-| `labels` | attrs of strings | `{}` | Container labels for metadata |
-| `pull` | enum | `"missing"` | `"missing"`, `"always"`, or `"never"` — image pull policy |
-| `extraArgs` | list of strings | `[]` | Extra arguments passed to `container run` (e.g. `--publish`, `--cpus`, `--memory`) |
-
-### `services.containerization.gc`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `automatic` | bool | `false` | Run garbage collection on activation |
-| `pruneContainers` | enum | `"stopped"` | `"none"`, `"stopped"`, or `"running"` |
-| `pruneImages` | bool | `false` | Remove dangling (untagged) images |
-
-`pruneContainers` strategies:
-- `"none"` — don't prune containers
-- `"stopped"` — run `container prune` (removes all stopped containers)
-- `"running"` — stop and remove containers not declared in config, then prune stopped
-
-> Note: Containers removed from config are always stopped and cleaned up on rebuild, regardless of GC settings. The GC options control cleanup of ad-hoc containers created outside your Nix config.
-
-### `services.containerization.teardown`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `removeImages` | bool | `false` | Remove pulled images when disabling. If false, images survive disable/enable cycles |
-
-### `services.containerization.linuxBuilder`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable` | bool | `false` | Run a Nix builder container for aarch64-linux builds |
-| `image` | string | `"ghcr.io/halfwhey/nix-builder:latest"` | Builder container image |
-| `sshPort` | port | `31022` | Host port for SSH to the builder |
-| `maxJobs` | int | `4` | Max parallel build jobs |
-
-Runs a Nix builder container for aarch64-linux builds. The default image (`ghcr.io/halfwhey/nix-builder`) is built from the `builder/Dockerfile` in this repo — it's a minimal `nixos/nix` image with sshd. Uses a known SSH key pair (builder only listens on localhost, same security model as nixpkgs' `darwin.linux-builder`).
-
-Builder Nix configuration is fully declarative:
-- **`nix.enable = true`** (plain nix-darwin): uses `nix.buildMachines`, `nix.distributedBuilds`, and `nix.settings`.
-- **Determinate Nix**: uses `determinateNix.customSettings`. Requires the [Determinate nix-darwin module](https://docs.determinate.systems/guides/nix-darwin/) — add the input and module to your flake:
-
-  ```nix
-  # flake inputs
-  determinate.url = "https://flakehub.com/f/DeterminateSystems/determinate/3";
-
-  # darwinSystem modules list
-  inputs.determinate.darwinModules.default
-
-  # darwin config
-  determinateNix.enable = true;
-  ```
-
-**Bootstrap**: First rebuild starts the builder. Second rebuild can use it for Linux derivations (e.g. nix2container images with `aarch64-linux` packages).
+See [docs/options.md][options] for the full option reference — `services.containerization`, containers, kernel, images, and linuxBuilder.
 
 ## Examples
 
@@ -194,17 +125,6 @@ services.containerization = {
 };
 ```
 
-### Aggressive garbage collection
-
-```nix
-services.containerization = {
-  enable = true;
-  gc.automatic = true;
-  gc.pruneContainers = "running";
-  gc.pruneImages = true;
-};
-```
-
 ### Custom kernel version
 
 ```nix
@@ -220,7 +140,7 @@ services.containerization = {
 
 ### Nix-built images with nix2container
 
-Build OCI images with [nix2container](https://github.com/nlewo/nix2container) and load them into the container runtime without storing full tarballs in the Nix store. Only a tiny JSON metadata file lives in the store — layers are streamed on-the-fly from existing Nix store paths at activation time.
+Build OCI images with [nix2container][nix2container] and load them into the container runtime without storing full tarballs in the Nix store. Only a tiny JSON metadata file lives in the store — layers are streamed on-the-fly from existing Nix store paths at activation time.
 
 Add the nix2container flake input:
 
@@ -257,7 +177,6 @@ in {
     containers.greeter = {
       image = "greeter:latest";
       autoStart = true;
-      pull = "never";  # image is loaded locally, not from a registry
       extraArgs = [ "--publish" "8080:8080" ];
     };
   };
@@ -266,9 +185,24 @@ in {
 
 Test it with `curl http://localhost:8080` after rebuild.
 
-Images are only re-loaded when their content changes (tracked via Nix store path). Removing an image from config cleans up the tracking marker; the image data itself is cleaned up by `gc.pruneImages`.
+Images are loaded into the runtime via `container image load` at activation time. The load is idempotent — images already present are skipped.
 
 > **Note**: Building nix2container images requires `aarch64-linux` packages. Enable `linuxBuilder` and rebuild twice: the first starts the builder, the second builds and loads the image.
+
+### Registry images
+
+Containers referencing images not in `images.*` are pulled automatically by the container runtime when `container run` is invoked. No Nix-side configuration is needed — just declare the container:
+
+```nix
+services.containerization = {
+  enable = true;
+
+  containers.alpine = {
+    image = "alpine:latest";
+    autoStart = true;
+  };
+};
+```
 
 ## Uninstall
 
@@ -276,12 +210,15 @@ Set `enable = false` and rebuild. The module will:
 
 1. Unload all container launchd agents
 2. Stop the container runtime
-3. Remove kernels and API server state (cheap to reinstall from Nix store)
-4. Remove builder configuration files (`/etc/nix/builder_ed25519*`, `/etc/nix/machines`, `/etc/nix/nix.custom.conf`, `/etc/ssh/ssh_config.d/200-nix-builder.conf`) if present
+3. Remove all runtime state (`~/Library/Application Support/com.apple.container/`)
+4. Remove builder SSH key (`/etc/nix/builder_ed25519*`) if present
 5. Remove module state (`/var/lib/nix-apple-container`)
 6. Clear user preference defaults and `.pkg` install receipts
 
-Pulled images are preserved by default. Set `teardown.removeImages = true` to also remove all image data.
-
 If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import. If you find any lingering artifacts please open an issue.
 
+[apple-containerization]: https://github.com/apple/containerization
+[builder-ci]: https://github.com/halfwhey/nix-apple-container/actions/workflows/build-builder.yml
+[nix-darwin]: https://github.com/LnL7/nix-darwin
+[nix2container]: https://github.com/nlewo/nix2container
+[options]: docs/options.md
