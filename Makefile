@@ -1,6 +1,6 @@
 NIX_VERSION       ?= $(shell sed -n 's/^FROM nixos\/nix:\(.*\)/\1/p' builder/Dockerfile)
 CONTAINER_VERSION ?= $(shell sed -n 's/.*version = "\(.*\)".*/\1/p' package.nix | head -1)
-MODULE_VERSION    := $(shell sed -n 's/.*description = ".*(\(v[0-9.]*\))".*/\1/p' flake.nix)
+MODULE_VERSION    := $(shell cat VERSION)
 IMAGE             := ghcr.io/halfwhey/nix-builder
 
 # Portable in-place sed (macOS requires empty-string extension argument)
@@ -29,7 +29,7 @@ ci-status: ## Show status of the latest CI runs
 	gh run list --workflow=build-builder.yml --limit=5
 
 release: ## Update README pin, push master, create GitHub release
-	@[ -n "$(MODULE_VERSION)" ] || (echo "error: could not extract version from flake.nix"; exit 1)
+	@[ -n "$(MODULE_VERSION)" ] || (echo "error: VERSION file is empty"; exit 1)
 	$(SED_I) 's|nix-apple-container/v[0-9][0-9.]*"|nix-apple-container/$(MODULE_VERSION)"|' README.md
 	git add README.md
 	git commit -m "docs: update pinned version to $(MODULE_VERSION)"
