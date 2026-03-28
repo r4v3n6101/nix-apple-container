@@ -1,13 +1,16 @@
-{ lib, stdenv, fetchurl, xar, cpio }:
+{ lib, stdenv, fetchurl, xar, cpio
+, version ? "0.10.0"
+, hash ? "sha256-xIHONVUk0DbDzdrH/SgeMXlNQGkL+aIfcy7z12+p/gg="
+}:
 
-stdenv.mkDerivation rec {
+stdenv.mkDerivation {
   pname = "apple-container";
-  version = "0.10.0";
+  inherit version;
 
   src = fetchurl {
     url =
       "https://github.com/apple/container/releases/download/${version}/container-${version}-installer-signed.pkg";
-    hash = "sha256-xIHONVUk0DbDzdrH/SgeMXlNQGkL+aIfcy7z12+p/gg=";
+    inherit hash;
   };
 
   nativeBuildInputs = [ xar cpio ];

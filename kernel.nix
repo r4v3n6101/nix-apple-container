@@ -1,10 +1,13 @@
-{ stdenv, cacert, curl, zstd, gnutar }:
+{ stdenv, cacert, curl, zstd, gnutar
+, version ? "3.26.0"
+, hash ? "sha256-Y+LzuhkEwPlEGDUW4xtN6sCcIELOm+3x9V18XpRA/1Y="
+}:
 
-stdenv.mkDerivation rec {
+stdenv.mkDerivation {
   pname = "kata-kernel";
-  version = "3.26.0";
+  inherit version;
 
-  outputHash = "sha256-Y+LzuhkEwPlEGDUW4xtN6sCcIELOm+3x9V18XpRA/1Y=";
+  outputHash = hash;
   outputHashMode = "flat";
 
   nativeBuildInputs = [ cacert curl zstd gnutar ];

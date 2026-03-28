@@ -4,8 +4,7 @@ set -euo pipefail
 # Update kata-containers kernel to the latest release
 
 REPO="kata-containers/kata-containers"
-CURRENT_URL=$(grep 'url = ' kernel.nix | sed 's/.*"\(.*\)".*/\1/')
-CURRENT_VER=$(echo "$CURRENT_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+CURRENT_VER=$(grep 'version ?' kernel.nix | sed 's/.*"\(.*\)".*/\1/')
 
 LATEST=$(gh release view --repo "$REPO" --json tagName -q .tagName)
 
@@ -20,8 +19,8 @@ URL="https://github.com/$REPO/releases/download/${LATEST}/kata-static-${LATEST}-
 HASH=$(nix-prefetch-url --type sha256 "$URL" 2>/dev/null | xargs nix hash convert --hash-algo sha256 --to sri)
 
 # Update kernel.nix
-sed -i '' "s|${CURRENT_VER}|${LATEST}|g" kernel.nix
-sed -i '' "s|hash = \".*\"|hash = \"${HASH}\"|" kernel.nix
+sed -i '' "s|version ? \"${CURRENT_VER}\"|version ? \"${LATEST}\"|" kernel.nix
+sed -i '' "s|hash ? \".*\"|hash ? \"${HASH}\"|" kernel.nix
 
 # Find the vmlinux binary name in the new tarball
 echo "Fetching tarball to detect vmlinux binary name..."
