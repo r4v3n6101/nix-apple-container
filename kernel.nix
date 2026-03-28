@@ -1,6 +1,6 @@
 { stdenv, cacert, curl, zstd, gnutar }:
 
-stdenv.mkDerivation {
+stdenv.mkDerivation rec {
   pname = "kata-kernel";
   version = "3.26.0";
 
@@ -10,7 +10,7 @@ stdenv.mkDerivation {
   nativeBuildInputs = [ cacert curl zstd gnutar ];
 
   buildCommand = ''
-    curl -L -o kata.tar.zst "https://github.com/kata-containers/kata-containers/releases/download/3.26.0/kata-static-3.26.0-arm64.tar.zst"
+    curl -L -o kata.tar.zst "https://github.com/kata-containers/kata-containers/releases/download/${version}/kata-static-${version}-arm64.tar.zst"
     tar --zstd -xf kata.tar.zst ./opt/kata/share/kata-containers/
     cp -L ./opt/kata/share/kata-containers/vmlinux.container $out
   '';

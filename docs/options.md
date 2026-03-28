@@ -9,7 +9,7 @@
 | `package` | package | *built from .pkg* | Override the container CLI package |
 | `images` | attrs of packages | `{}` | nix2container images to load (buildImage or pullImage) |
 | `preserveImagesOnDisable` | bool | `false` | Keep loaded images when the module is disabled |
-| `preserveVolumesOnDisable` | bool | `false` | Keep runtime-managed volume data when the module is disabled (bind mounts are always preserved) |
+| `preserveVolumesOnDisable` | bool | `false` | Keep named volume data when the module is disabled. Best-effort based on known runtime directory layout. Bind mounts are always preserved (they live on the host) |
 
 ## `services.containerization.kernel`
 
@@ -22,17 +22,17 @@
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `image` | string | *required* | Image name:tag (from `images.*` or a registry — the runtime pulls automatically) |
-| `autoStart` | bool | `false` | Run via launchd user agent on login |
+| `autoStart` | bool | `false` | Run via launchd user agent on login. When false, the name is reserved (prevents drift cleanup) but no container is created |
 | `cmd` | list of strings | `[]` | Override the image CMD |
 | `env` | attrs of strings | `{}` | Environment variables |
-| `volumes` | list of strings | `[]` | Volume mounts (macOS 26+). `host:container` for bind mounts, or just a container path for runtime-managed volumes (deleted on module disable) |
+| `volumes` | list of strings | `[]` | Volume mounts (macOS 26+). `host:container` for bind mounts or `name:container` for named volumes. Every entry must contain a `:` |
 | `autoCreateMounts` | bool | `true` | Create host directories for volume mounts if they don't exist |
 | `entrypoint` | string or null | `null` | Override the image entrypoint |
 | `user` | string or null | `null` | Run as UID or UID:GID |
 | `workdir` | string or null | `null` | Override working directory |
 | `init` | bool | `false` | Run init for signal forwarding and zombie reaping |
 | `ssh` | bool | `false` | Forward SSH agent from host |
-| `network` | string or null | `null` | Attach to custom network (macOS 26+) |
+| `network` | string or null | `null` | Attach to custom network (macOS 26+). The module does not create or manage networks — use `container network` commands manually |
 | `readOnly` | bool | `false` | Read-only root filesystem |
 | `labels` | attrs of strings | `{}` | Container labels for metadata |
 | `extraArgs` | list of strings | `[]` | Extra arguments passed to `container run` (e.g. `--publish`, `--cpus`, `--memory`) |
@@ -50,7 +50,7 @@ Runs a Nix builder container for aarch64-linux builds. The default image (`ghcr.
 
 Builder Nix configuration is fully declarative:
 - **`nix.enable = true`** (plain nix-darwin): uses `nix.buildMachines`, `nix.distributedBuilds`, and `nix.settings`.
-- **Determinate Nix**: uses `determinateNix.customSettings`. Requires the [Determinate nix-darwin module](https://docs.determinate.systems/guides/nix-darwin/):
+- **Determinate Nix**: uses `determinateNix.customSettings`. Note: `builders` is a single string setting — if another module also sets `determinateNix.customSettings.builders`, they will conflict. Requires the [Determinate nix-darwin module](https://docs.determinate.systems/guides/nix-darwin/):
 
   <details>
   <summary>Determinate Nix flake setup</summary>

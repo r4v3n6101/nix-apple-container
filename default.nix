@@ -19,7 +19,8 @@ let
       autoStart = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Automatically start this container via launchd.";
+        description =
+          "Automatically start this container via launchd. When false, the container name is reserved (prevents drift cleanup) but no container is created or managed.";
       };
       cmd = lib.mkOption {
         type = lib.types.listOf lib.types.str;
@@ -35,7 +36,7 @@ let
         type = lib.types.listOf lib.types.str;
         default = [ ];
         description =
-          "Volume mounts (macOS 26+). Use host:container for bind mounts or just a container path for runtime-managed volumes (lost on module disable).";
+          "Volume mounts (macOS 26+). Use host:container for bind mounts or name:container for named volumes. Every entry must contain a ':'.";
       };
       autoCreateMounts = lib.mkOption {
         type = lib.types.bool;
@@ -100,6 +101,12 @@ let
     imageRef = "${img.imageName}:${img.imageTag}";
   }) cfg.images;
 
+  # Lookup from imageRef → copyTo store path, used to embed a content-dependent
+  # comment in container wrapper scripts so plist changes trigger agent restarts.
+  nixImagePaths = lib.mapAttrs' (_: r:
+    lib.nameValuePair r.imageRef "${r.copyTo}"
+  ) resolvedImages;
+
   appSupport = "${userHome}/Library/Application Support/com.apple.container";
   agentDir = "${userHome}/Library/LaunchAgents";
 
@@ -145,26 +152,37 @@ let
       '') c.volumes)) cfg.containers);
 
   # Load nix2container images via `container image load` at activation time.
-  # Idempotent — skips images already present in the runtime.
+  # Content-aware: runs copyTo to a temp OCI layout, reads the manifest digest from
+  # index.json, and compares against the runtime. Only tars+loads when content differs.
   imageLoadScript = lib.optionalString (cfg.images != { }) ''
     ${lib.concatStrings (lib.mapAttrsToList (name: _:
       let r = resolvedImages.${name};
       in ''
-        if ! ${runAs} ${bin} image ls 2>/dev/null | grep -qF "${r.imageRef}"; then
+        TMPDIR=$(mktemp -d)
+        "${r.copyTo}/bin/copy-to" "oci:$TMPDIR:${r.imageName}:${r.imageTag}"
+        EXPECTED_DIGEST=$(${pkgs.jq}/bin/jq -r '.manifests[0].digest' "$TMPDIR/index.json")
+        CURRENT_DIGEST=$(${runAs} ${bin} image inspect "${r.imageRef}" 2>/dev/null \
+          | ${pkgs.jq}/bin/jq -r '.[].index.digest' 2>/dev/null || echo "")
+        if [ "$EXPECTED_DIGEST" = "$CURRENT_DIGEST" ]; then
+          echo "nix-apple-container: image ${r.imageRef} is current"
+          rm -rf "$TMPDIR"
+        else
+          if [ -n "$CURRENT_DIGEST" ]; then
+            echo "nix-apple-container: removing stale image ${r.imageRef}..."
+            ${runAs} ${bin} image rm "${r.imageRef}" 2>/dev/null || true
+          fi
           echo "nix-apple-container: loading image ${r.imageRef}..."
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
-          "${r.copyTo}/bin/copy-to" "oci:$TMPDIR:${r.imageName}:${r.imageTag}"
           tar cf "$TMPDIR.tar" -C "$TMPDIR" .
           chmod 644 "$TMPDIR.tar"
           ${runAs} ${bin} image load -i "$TMPDIR.tar"
-          rm -f "$TMPDIR.tar"
+          rm -rf "$TMPDIR" "$TMPDIR.tar"
         fi
       '') cfg.images)}
   '';
 
   mkContainerRunScript = name: c:
     let
+      nixImagePath = nixImagePaths.${c.image} or null;
       allLabels = c.labels // { "managed-by" = "nix-apple-container"; };
       args = [ bin "run" "--name" name ]
         ++ lib.optionals (c.entrypoint != null) [ "--entrypoint" c.entrypoint ]
@@ -180,6 +198,7 @@ let
         ++ (lib.concatMap (v: [ "--volume" v ]) c.volumes) ++ c.extraArgs
         ++ [ c.image ] ++ c.cmd;
     in pkgs.writeShellScript "container-run-${name}" ''
+      ${lib.optionalString (nixImagePath != null) "# nix-image: ${nixImagePath}"}
       ${bin} stop ${lib.escapeShellArg name} 2>/dev/null || true
       ${bin} rm ${lib.escapeShellArg name} 2>/dev/null || true
       exec ${lib.escapeShellArgs args}
@@ -253,7 +272,7 @@ in {
       type = lib.types.bool;
       default = false;
       description =
-        "Keep runtime-managed volume data when the module is disabled. By default, teardown removes all runtime state. Does not affect bind-mounted volumes (those are always preserved).";
+        "Keep named volume data when the module is disabled. Best-effort based on known runtime directory layout. Bind mounts are always preserved (they live on the host).";
     };
 
   };
@@ -285,29 +304,29 @@ in {
           (!cfg.preserveImagesOnDisable && !cfg.preserveVolumesOnDisable) ''
             rm -rf "$APP_SUPPORT"
           ''}
-
-          ${runAs} defaults delete com.apple.container 2>/dev/null || true
-
-          pkgutil --pkg-info com.apple.container-installer &>/dev/null && \
-            sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
         fi
 
         # These run regardless of APP_SUPPORT existence
+        ${runAs} defaults delete com.apple.container 2>/dev/null || true
+        pkgutil --pkg-info com.apple.container-installer &>/dev/null && \
+          sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
         rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
       '';
     })
 
     # Setup: runs when module is enabled
     (lib.mkIf cfg.enable {
-      warnings = let
-        containersWithUnnamedVolumes = lib.filterAttrs
+      assertions = let
+        bad = lib.filterAttrs
           (_: c: builtins.any (v: !(lib.hasInfix ":" v)) c.volumes)
           cfg.containers;
-      in lib.optional (containersWithUnnamedVolumes != { })
-        "nix-apple-container: containers ${
-          lib.concatStringsSep ", "
-          (lib.attrNames containersWithUnnamedVolumes)
-        } use unnamed volumes (no host path). These are stored inside the container runtime and will be deleted if you disable the module (enable = false). Use bind mounts (host:container) for data that must survive module teardown.";
+      in lib.optional (bad != { }) {
+        assertion = false;
+        message =
+          "nix-apple-container: containers ${
+            lib.concatStringsSep ", " (lib.attrNames bad)
+          } have volumes without a ':'. Use host:container for bind mounts or name:container for named volumes.";
+      };
 
       environment.systemPackages = [ cfg.package ];
 
@@ -398,10 +417,12 @@ in {
 
       # SSH key must be imperative — SSH requires 0600, can't use a world-readable store path
       system.activationScripts.preActivation.text = lib.mkAfter ''
-        install -m 600 ${./builder/builder_ed25519} /etc/nix/builder_ed25519
-        install -m 644 ${
-          ./builder/builder_ed25519.pub
-        } /etc/nix/builder_ed25519.pub
+        if ! cmp -s ${./builder/builder_ed25519} /etc/nix/builder_ed25519 2>/dev/null; then
+          install -m 600 ${./builder/builder_ed25519} /etc/nix/builder_ed25519
+          install -m 644 ${
+            ./builder/builder_ed25519.pub
+          } /etc/nix/builder_ed25519.pub
+        fi
       '';
 
       # SSH config for builder alias (port mapping + host key skipping).
@@ -450,8 +471,8 @@ in {
         speedFactor = 1;
         supportedFeatures = [ "big-parallel" ];
       }];
-      nix.distributedBuilds = true;
-      nix.settings.builders-use-substitutes = true;
+      nix.distributedBuilds = lib.mkDefault true;
+      nix.settings.builders-use-substitutes = lib.mkDefault true;
     })
 
     # Linux builder — Determinate Nix config (nix.enable = false, determinateNix module available)

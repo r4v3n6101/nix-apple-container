@@ -26,6 +26,7 @@ stdenv.mkDerivation rec {
     cp -a libexec/container $out/libexec/
   '';
 
+  # Apple-signed binaries — strip/fixup would break code signature
   dontFixup = true;
 
   meta = with lib; {

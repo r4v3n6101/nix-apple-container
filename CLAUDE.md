@@ -40,7 +40,7 @@ The module uses:
 `preActivation`:
 1. `container system status` — check if runtime is running; only start if not (fails loudly on error, no `|| true`)
 2. Kernel symlink — creates `$APP_SUPPORT/kernels/default.kernel-arm64` as a symlink to the kernel binary in the Nix store. Fully declarative — the store path changes when the config changes, updating the symlink on next rebuild.
-3. Image loading — for each image in `images.*`, checks if it's already present via `container image ls`, and loads it via `container image load -i` if missing. Must happen before launchd starts containers.
+3. Image loading — for each image in `images.*`, compares the manifest digest from the Nix store against the runtime. Loads via `container image load -i` if missing or stale. Must happen before launchd starts containers.
 4. Creates mount directories for containers with `autoCreateMounts = true` (only for absolute host paths)
 5. Prunes stopped containers (`container prune`)
 
@@ -61,19 +61,21 @@ Each container's `ProgramArguments` points to a wrapper script (`mkContainerRunS
 
 This wrapper ensures config changes are applied cleanly — when the plist changes, nix-darwin reloads the agent, the new wrapper cleans up the old container VM, and starts fresh. The `--detach` flag is NOT used because launchd manages the process lifecycle.
 
+For containers referencing Nix-managed images (in `images.*`), the wrapper script embeds the image's `copyTo` store path as a comment. When image content changes, the store path changes, the script content changes, the plist changes, and nix-darwin restarts the agent — ensuring the container picks up the new image. Registry images are unaffected.
+
 ### Teardown (enable = false)
 
-Guarded by `if [ -d "$APP_SUPPORT" ]` — only runs if container state exists (prevents noisy no-ops on first import with `enable = false`).
+Agent unloading, defaults cleanup, and builder key removal run unconditionally. Runtime state cleanup is guarded by `if [ -d "$APP_SUPPORT" ]` to prevent noisy no-ops on first import with `enable = false`.
 
 When disabled:
-1. Unloads all module-owned launchd agents (`dev.apple.container.*.plist`) — runs before system stop to prevent KeepAlive restart loops
-2. `container system stop` — deregisters launchd services, stops containers
+1. Unloads all module-owned launchd agents (`dev.apple.container.*.plist`) — runs unconditionally, before system stop to prevent KeepAlive restart loops
+2. `container system stop` — deregisters launchd services, stops containers (guarded by APP_SUPPORT)
 3. Always removes `kernels/` and `content/ingest/` (safe to recreate)
 4. If `preserveImagesOnDisable = false` (default): removes `content/` (image blobs + metadata)
 5. If both preserve options are false (default): removes entire `$APP_SUPPORT` directory
-6. `defaults delete com.apple.container`
-7. `pkgutil --forget com.apple.container-installer` (if receipt exists)
-8. Removes builder files (`/etc/nix/builder_ed25519*`) if present
+6. `defaults delete com.apple.container` — runs unconditionally (with error suppression)
+7. `pkgutil --forget com.apple.container-installer` (if receipt exists) — runs unconditionally
+8. Removes builder files (`/etc/nix/builder_ed25519*`) — runs unconditionally
 
 ### Linux builder (linuxBuilder.enable = true)
 
@@ -96,7 +98,7 @@ Two image sources:
 
 **Critical**: Image loading runs in `preActivation` (not postActivation) because launchd starts containers between pre and post.
 
-**Idempotency**: The `container image ls | grep` check makes loading idempotent — images already present are skipped.
+**Idempotency**: Image loading runs `copyTo` to a temp OCI layout, reads the manifest digest from `index.json`, and compares against the runtime via `container image inspect`. If digests match, the temp dir is cleaned up and the load is skipped. If the content changed (even with the same tag), the old image is removed via `container image rm` and the new one is loaded. This is stateless — no marker files needed.
 
 ### Root vs user context
 
@@ -110,7 +112,7 @@ Every activation script and feature MUST follow these rules:
 
 ### Idempotency
 
-- **Guard before acting**: Check state before modifying. Don't start the runtime if already running (`system status`). Don't install the kernel if the identity marker matches. Don't append to `known_hosts` if the key is already present.
+- **Guard before acting**: Check state before modifying. Don't start the runtime if already running (`system status`). Don't reload images if the digest matches. Don't append to `known_hosts` if the key is already present.
 - **No unconditional appends**: Never `>> file` without checking if the content is already there. Use `grep -qF` to deduplicate.
 - **No unconditional restarts**: Don't restart daemons unless config actually changed. nix-darwin's plist diffing handles launchd agents. The Nix daemon reads `/etc/nix/machines` on demand.
 - **Activation scripts run on every rebuild**: Assume they run repeatedly with no config changes. They must produce no side effects in that case.
@@ -127,7 +129,7 @@ Every feature that creates state outside the Nix store MUST clean it up when dis
 | Kernel | Symlinks in `$APP_SUPPORT/kernels/` pointing to Nix store | Removed with kernels dir on teardown (always cleaned); binary in Nix store protected by system profile |
 | Images (`images.*`) | Images loaded into runtime's own storage via `container image load` | Removed with `content/` unless `preserveImagesOnDisable = true` |
 | Mount directories (`autoCreateMounts`) | Host directories for volumes (absolute paths only) | NOT cleaned up (user data, intentionally preserved) |
-| Unnamed volumes | Runtime-managed storage inside `$APP_SUPPORT` (volumes without a host path) | Destroyed with `$APP_SUPPORT` unless `preserveVolumesOnDisable = true` — a build-time warning is emitted |
+| Named volumes | Runtime-managed storage inside `$APP_SUPPORT` | Destroyed with `$APP_SUPPORT` unless `preserveVolumesOnDisable = true` |
 
 ### nix-darwin's `userLaunchd` limitation
 
