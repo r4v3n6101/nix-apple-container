@@ -244,6 +244,16 @@ Set `enable = false` and rebuild. The module will:
 
 If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import. If you find any lingering artifacts please open an issue.
 
+### Standalone uninstall
+
+If you've already removed the module import, or prefer a one-command cleanup:
+
+```
+nix run github:halfwhey/nix-apple-container#uninstall
+```
+
+This performs the same teardown as `enable = false` — stops the runtime, removes agents, cleans up state. Accepts `--preserve-images`, `--preserve-volumes`, and `--yes` (skip confirmation).
+
 [apple-containerization]: https://github.com/apple/containerization
 [nix-darwin]: https://github.com/LnL7/nix-darwin
 [nix2container]: https://github.com/nlewo/nix2container

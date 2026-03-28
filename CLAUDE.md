@@ -13,10 +13,11 @@ This is a nix-darwin module that wraps Apple's [Containerization](https://github
 - `builder/builder_ed25519` / `builder/builder_ed25519.pub` — known SSH key pair for the linux builder (intentionally public, same model as nixpkgs' `darwin.linux-builder`)
 - `Makefile` — build/push/release/update targets for the builder image and module
 - `scripts/` — update scripts: `update-container.sh`, `update-kernel.sh`, `update-nix-builder.sh`
+- `scripts/uninstall.sh` — standalone uninstall script; mirrors the module teardown logic for use when the module import has been removed
 - `.github/workflows/build-builder.yml` — builds and pushes the nix-builder image on changes to `builder/**`; tags with the Nix version; commits updated default image back to `default.nix`
 - `.github/workflows/update-nix-builder.yml` — weekly scheduled workflow; checks Docker Hub for a newer `nixos/nix` tag and bumps `builder/Dockerfile` if stale, triggering `build-builder.yml` via the path filter
 
-The flake exposes `darwinModules.default`, `packages.aarch64-darwin.default`, and `packages.aarch64-darwin.kernel`.
+The flake exposes `darwinModules.default`, `packages.aarch64-darwin.default`, `packages.aarch64-darwin.kernel`, and `packages.aarch64-darwin.uninstall`.
 
 ## How the package works
 

@@ -31,8 +31,8 @@ ci-status: ## Show status of the latest CI runs
 release: ## Update README pin, push master, create GitHub release
 	@[ -n "$(MODULE_VERSION)" ] || (echo "error: VERSION file is empty"; exit 1)
 	$(SED_I) 's|nix-apple-container/v[0-9][0-9.]*"|nix-apple-container/$(MODULE_VERSION)"|' README.md
-	git add README.md
-	git commit -m "docs: update pinned version to $(MODULE_VERSION)"
+	git add README.md VERSION
+	git commit -m "$(MODULE_VERSION)"
 	git push origin master
 	gh release create $(MODULE_VERSION) --generate-notes
 
