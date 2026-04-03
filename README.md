@@ -254,7 +254,22 @@ nix run github:halfwhey/nix-apple-container#uninstall
 
 This performs the same teardown as `enable = false` — stops the runtime, removes agents, cleans up state. Accepts `--preserve-images`, `--preserve-volumes`, and `--yes` (skip confirmation).
 
+## Troubleshooting
+
+### VPN breaks container networking
+
+Active VPN or tunnel interfaces (`utun*`) break the vmnet port forwarding used by `--publish`. Symptoms include `curl: (56) Connection reset by peer` on published ports and failure to resolve `.test` DNS names — even though the container itself is running normally.
+
+This is a [known upstream issue][vpn-issue]. The only current workaround is to disconnect the VPN before starting containers. macOS 26 is expected to overhaul container networking.
+
+To check for active tunnel interfaces:
+
+```bash
+ifconfig | grep utun
+```
+
 [apple-containerization]: https://github.com/apple/containerization
 [nix-darwin]: https://github.com/LnL7/nix-darwin
 [nix2container]: https://github.com/nlewo/nix2container
 [options]: docs/options.md
+[vpn-issue]: https://github.com/apple/container/issues/1307

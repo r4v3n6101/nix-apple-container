@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
       - uses: actions/checkout@v4
@@ -42,3 +43,9 @@ jobs:
           git add builder/Dockerfile
           git commit -m "chore: bump nix-builder to ${{ steps.versions.outputs.latest }}"
           git push origin master
+
+      - name: Trigger builder image build
+        if: steps.versions.outputs.current != steps.versions.outputs.latest
+        run: gh workflow run build-builder.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
