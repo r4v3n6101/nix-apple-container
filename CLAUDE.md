@@ -2,6 +2,16 @@
 
 Technical reference for working on nix-apple-container.
 
+## Shell script conventions
+
+When creating bash scripts, always check that required external binaries exist at the top of the script and fail with a descriptive error. Example:
+
+```bash
+for cmd in tart packer sshpass; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: '$cmd' is required but not found in PATH" >&2; exit 1; }
+done
+```
+
 ## Architecture
 
 This is a nix-darwin module that wraps Apple's [Containerization](https://github.com/apple/containerization) framework.
@@ -16,6 +26,7 @@ This is a nix-darwin module that wraps Apple's [Containerization](https://github
 - `scripts/uninstall.sh` — standalone uninstall script; mirrors the module teardown logic for use when the module import has been removed
 - `.github/workflows/build-builder.yml` — builds and pushes the nix-builder image on changes to `builder/**`; tags with the Nix version; commits updated default image back to `default.nix`
 - `.github/workflows/update-nix-builder.yml` — weekly scheduled workflow; checks Docker Hub for a newer `nixos/nix` tag and bumps `builder/Dockerfile` if stale, triggering `build-builder.yml` via the path filter
+- `.github/workflows/update-container.yml` — weekly scheduled workflow; checks GitHub releases for a newer `apple/container` tag and bumps `package.nix` if stale
 
 The flake exposes `darwinModules.default`, `packages.aarch64-darwin.default`, `packages.aarch64-darwin.kernel`, and `packages.aarch64-darwin.uninstall`.
 
@@ -26,7 +37,7 @@ The `container` CLI is distributed as a flat `.pkg` (not a `.dmg`). Extraction:
 1. `xar -xf` the `.pkg` — produces a `Payload` file at the top level (no sub-packages)
 2. `gunzip -dc Payload | cpio -i` — extracts to `./bin/` and `./libexec/`
 3. Binaries: `bin/container`, `bin/container-apiserver`
-4. Plugins: `libexec/container/plugins/{container-runtime-linux,container-core-images,container-network-vmnet}/`
+4. Plugins: `libexec/container/plugins/{container-runtime-linux,container-core-images,container-network-vmnet}/` — each contains a `bin/<name>` binary and a `config.json`
 
 The `.pkg` does NOT extract to `usr/local/` — files are at the root of the payload. This was discovered by manual inspection; the initial assumption of `usr/local/bin/` was wrong.
 
@@ -176,6 +187,12 @@ Pre-building OCI layout dirs as Nix derivations (`runCommand` with `copyTo`) and
 
 ### macOS bsdtar argument ordering
 `tar -C dir -cf file .` doesn't work on macOS bsdtar — the `-C` before `-cf` is ignored, producing empty archives. Use `tar cf file -C dir .` instead.
+
+### Headless Mac: launchd user agents fail without a GUI session
+On headless Mac minis (no display, no logged-in console session), the `gui/<uid>` launchd domain doesn't exist. `launchctl load` and user agent plists fail because `launchd.user.agents` targets this domain. Containers declared as user agents won't start. The fix is to enable auto-login so macOS creates a persistent GUI session on boot: `system.defaults.loginwindow.autoLoginUser = "<user>";` in the nix-darwin config, or `sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser <user>` imperatively. Reboot required.
+
+### Stale apiserver launchd registration hangs all CLI commands
+If the `container` CLI was previously run from a different install path (e.g., a source build in `.build/debug/`, or a Nix store path that was later garbage collected), launchd retains the apiserver registration pointing to the old binary. Every `container` command — including `--help`, `system status`, `system stop` — hangs indefinitely at "checking if APIServer is alive" because XPC blocks waiting for launchd to activate a binary that doesn't exist (launchd enters exponential throttle). Fix: `launchctl bootout user/$(id -u)/com.apple.container.apiserver`. See [#1329](https://github.com/apple/container/issues/1329).
 
 ### Kernel install prompt
 `container system start` prompts interactively: "Install the recommended default kernel from [URL]? [Y/n]:". This hangs non-interactive environments. The module uses `--disable-kernel-install` on `system start` and manages the kernel declaratively — `kernel.nix` extracts the binary into the Nix store, and the activation script symlinks it into the runtime's `kernels/` directory.
