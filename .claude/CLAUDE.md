@@ -24,8 +24,7 @@ This is a nix-darwin module that wraps Apple's [Containerization](https://github
 - `Makefile` — build/push/release/update targets for the builder image and module
 - `scripts/` — update scripts: `update-container.sh`, `update-kernel.sh`, `update-nix-builder.sh`
 - `scripts/uninstall.sh` — standalone uninstall script; mirrors the module teardown logic for use when the module import has been removed
-- `.github/workflows/build-builder.yml` — builds and pushes the nix-builder image on changes to `builder/**`; tags with the Nix version; commits updated default image back to `default.nix`
-- `.github/workflows/update-nix-builder.yml` — weekly scheduled workflow; checks Docker Hub for a newer `nixos/nix` tag and bumps `builder/Dockerfile` if stale, triggering `build-builder.yml` via the path filter
+- `.github/workflows/build-builder.yml` — weekly scheduled workflow (and push trigger on `builder/**`); on schedule, checks Docker Hub for a newer `nixos/nix` tag and, if stale, updates `builder/Dockerfile`, builds and pushes the image, updates `default.nix`, and commits both files in a single commit; on push/dispatch, builds and pushes the image and commits only the `default.nix` change
 - `.github/workflows/update-container.yml` — weekly scheduled workflow; checks GitHub releases for a newer `apple/container` tag and bumps `package.nix` if stale
 
 The flake exposes `darwinModules.default`, `packages.aarch64-darwin.default`, `packages.aarch64-darwin.kernel`, and `packages.aarch64-darwin.uninstall`.
@@ -98,9 +97,7 @@ When disabled:
 
 Runs `ghcr.io/halfwhey/nix-builder` (based on `nixos/nix`) as an Apple container with sshd, configured as a Nix remote builder for aarch64-linux builds. Uses a known SSH key pair committed to the repo (same security model as nixpkgs' `darwin.linux-builder` — builder only listens on localhost).
 
-The default image tag in `default.nix` (`services.containerization.linuxBuilder.image`) tracks the Nix version used in the Dockerfile (e.g. `2.34.3`), not `:latest`. It is bumped automatically by `build-builder.yml` after each successful image push. The auto-update cascade is:
-1. `update-nix-builder.yml` (weekly) detects a newer `nixos/nix` tag → bumps `builder/Dockerfile` → pushes to master
-2. `build-builder.yml` fires on the `builder/**` path change → builds and pushes image tagged `:<nix-version>` → commits updated default to `default.nix`
+The default image tag in `default.nix` (`services.containerization.linuxBuilder.image`) tracks the Nix version used in the Dockerfile (e.g. `2.34.3`), not `:latest`. It is bumped automatically by `build-builder.yml` after each successful image push. The auto-update cascade is handled by a single `build-builder.yml` run: detects a newer `nixos/nix` tag → updates `builder/Dockerfile`, builds and pushes image tagged `:<nix-version>`, updates `default.nix` → commits all changes in one commit.
 
 Users can override the image via `services.containerization.linuxBuilder.image = "ghcr.io/halfwhey/nix-builder:2.34.3"`.
 

@@ -1,6 +1,8 @@
 name: Build builder image
 
 on:
+  schedule:
+    - cron: '0 8 * * 1'
   push:
     branches: [master]
     paths:
@@ -20,31 +22,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get Nix version
-        id: nix-version
-        run: echo "version=$(sed -n 's/^FROM nixos\/nix:\(.*\)/\1/p' builder/Dockerfile)" >> $GITHUB_OUTPUT
+      - name: Check version
+        id: versions
+        run: |
+          CURRENT=$(sed -n 's/^FROM nixos\/nix:\(.*\)/\1/p' builder/Dockerfile)
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            LATEST=$(curl -s "https://hub.docker.com/v2/repositories/nixos/nix/tags?page_size=100" \
+              | jq -r '.results[].name' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -1)
+            echo "latest=$LATEST" >> $GITHUB_OUTPUT
+            [ "$CURRENT" != "$LATEST" ] && echo "proceed=true" >> $GITHUB_OUTPUT || echo "proceed=false" >> $GITHUB_OUTPUT
+          else
+            echo "latest=$CURRENT" >> $GITHUB_OUTPUT
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Already up to date
+        if: github.event_name == 'schedule' && steps.versions.outputs.proceed == 'false'
+        run: echo "nixos/nix is already up to date (${{ steps.versions.outputs.current }})"
+
+      - name: Update Dockerfile
+        if: github.event_name == 'schedule' && steps.versions.outputs.proceed == 'true'
+        run: sed -i 's|^FROM nixos/nix:.*|FROM nixos/nix:${{ steps.versions.outputs.latest }}|' builder/Dockerfile
 
       - uses: docker/setup-qemu-action@v3
+        if: steps.versions.outputs.proceed == 'true'
 
       - uses: docker/setup-buildx-action@v3
+        if: steps.versions.outputs.proceed == 'true'
 
       - uses: docker/login-action@v3
+        if: steps.versions.outputs.proceed == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        if: steps.versions.outputs.proceed == 'true'
         with:
           context: builder
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ steps.nix-version.outputs.version }}
+            ${{ env.IMAGE }}:${{ steps.versions.outputs.latest }}
 
-      - name: Bump linuxBuilder default image
+      - name: Update default.nix
+        if: steps.versions.outputs.proceed == 'true'
+        run: perl -i -pe 's|ghcr.io/halfwhey/nix-builder:[^"]*|ghcr.io/halfwhey/nix-builder:${{ steps.versions.outputs.latest }}|' default.nix
+
+      - name: Commit and push
+        if: steps.versions.outputs.proceed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          make bump-linux-builder
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            git add builder/Dockerfile default.nix
+          else
+            git add default.nix
+          fi
+          git diff --cached --quiet || git commit -m "chore: bump nix-builder to ${{ steps.versions.outputs.latest }}"
+          git push origin master
