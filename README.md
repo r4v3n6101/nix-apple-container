@@ -41,9 +41,9 @@ A nix-darwin module for declaratively managing [Apple Containerization][apple-co
 macOS: 26.3 (25D125)
 Arch: arm64
 Nix: nix (Determinate Nix 3.17.1) 2.33.3
-Apple Container: container CLI version 0.10.0 (build: release, commit: 6bdb647)
-nix-darwin: github:LnL7/nix-darwin/da529ac (2026-03-08)
-nixpkgs: github:nixos/nixpkgs/e802360 (2026-03-14)
+Apple Container: container CLI version 0.11.0 (build: release, commit: d9b8a8d)
+nix-darwin: github:LnL7/nix-darwin/06648f4 (2026-04-01)
+nixpkgs: github:NixOS/nixpkgs/a62e6ed (2024-05-31)
 ```
 
 </details>
