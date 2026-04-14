@@ -109,6 +109,8 @@ let
 
   appSupport = "${userHome}/Library/Application Support/com.apple.container";
   agentDir = "${userHome}/Library/LaunchAgents";
+  userBuilderKey = "${userHome}/.ssh/nix-builder_ed25519";
+  userBuilderPubKey = "${userHome}/.ssh/nix-builder_ed25519.pub";
 
   # Unload and remove module-owned launchd agents.
   # If declaredAgents is empty, unloads ALL agents (teardown).
@@ -203,17 +205,6 @@ let
       ${bin} rm ${lib.escapeShellArg name} 2>/dev/null || true
       exec ${lib.escapeShellArgs args}
     '';
-
-  ensureResolverScript = ''
-    mkdir -p /etc/resolver
-
-    printf '%s\n' \
-      'domain test' \
-      'search test' \
-      'nameserver 127.0.0.1' \
-      'port 2053' \
-      > /etc/resolver/containerization.test
-  '';
 
 in {
   options.services.containerization = {
@@ -338,12 +329,16 @@ in {
         fi
 
         # These run regardless of APP_SUPPORT existence
-        ${runAs} ${bin} system property clear dns.domain 2>/dev/null || true
-        ${runAs} defaults delete com.apple.container 2>/dev/null || true
+        ${
+          if cfg.user == config.system.primaryUser then
+            ''${runAs} defaults delete com.apple.container.defaults dns.domain 2>/dev/null || true''
+          else
+            ''${runAs} ${bin} system property clear dns.domain 2>/dev/null || true''
+        }
         pkgutil --pkg-info com.apple.container-installer &>/dev/null && \
           sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
+        rm -f "${userBuilderKey}" "${userBuilderPubKey}"
         rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
-        rm -f /etc/resolver/containerization.test
       '';
     })
 
@@ -362,6 +357,28 @@ in {
       };
 
       environment.systemPackages = [ cfg.package ];
+
+      environment.etc."resolver/containerization.test" = {
+        text = ''
+          domain test
+          search test
+          nameserver 127.0.0.1
+          port 2053
+        '';
+
+        # Accept the previously hand-written resolver file on first migration
+        # so activation can replace it with the declarative /etc symlink.
+        knownSha256Hashes = [
+          "99b89c6edbb7edea675a76545841411eec5cca0d6222be61769f83f5828691b6"
+        ];
+      };
+
+      system.defaults.CustomUserPreferences = lib.mkIf
+        (cfg.user == config.system.primaryUser) {
+          "com.apple.container.defaults" = {
+            "dns.domain" = "test";
+          };
+        };
 
       launchd.user.agents = lib.mapAttrs' (name: c:
         lib.nameValuePair "container-${name}" {
@@ -401,10 +418,12 @@ in {
               echo "nix-apple-container: starting runtime..."
               ${runAs} ${bin} system start --disable-kernel-install
             fi
-            if [ "$(${runAs} ${bin} system property get dns.domain 2>/dev/null || true)" != "test" ]; then
-              echo "nix-apple-container: setting default DNS domain to test..."
-              ${runAs} ${bin} system property set dns.domain test
-            fi
+            ${lib.optionalString (cfg.user != config.system.primaryUser) ''
+              if [ "$(${runAs} ${bin} system property get dns.domain 2>/dev/null || true)" != "test" ]; then
+                echo "nix-apple-container: setting default DNS domain to test..."
+                ${runAs} ${bin} system property set dns.domain test
+              fi
+            ''}
             KERNEL_DIR="${appSupport}/kernels"
             ${runAs} mkdir -p "$KERNEL_DIR"
             ${runAs} ln -sf "${cfg.kernel}" "$KERNEL_DIR/default.kernel-arm64"
@@ -448,18 +467,23 @@ in {
           fi
         done
 
-        echo "nix-apple-container: ensuring host resolver for .test..."
-        ${ensureResolverScript}
       '');
+
+      system.activationScripts.etc.text = lib.mkAfter ''
+        if [ -e /etc/resolver/containerization.test.before-nix-darwin ]; then
+          rm /etc/resolver/containerization.test.before-nix-darwin
+        fi
+      '';
     })
 
     # Linux builder cleanup (module enabled but builder disabled)
     (lib.mkIf (cfg.enable && !cfg.linuxBuilder.enable) {
       system.activationScripts.postActivation.text = lib.mkAfter ''
-        if [ -f /etc/nix/builder_ed25519 ]; then
+        if [ -f "${userBuilderKey}" ] || [ -f /etc/nix/builder_ed25519 ]; then
           echo "nix-apple-container: removing linux builder resources..."
-          rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
         fi
+        rm -f "${userBuilderKey}" "${userBuilderPubKey}"
+        rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
       '';
     })
 
@@ -478,26 +502,25 @@ in {
         ];
       };
 
-      # SSH key must be imperative — SSH requires 0600, can't use a world-readable store path
+      # Keep a single canonical client key in the configured user's home.
+      # Root can still read it for daemon-driven builds, so no duplicate
+      # /etc/nix copy is needed.
       system.activationScripts.preActivation.text = lib.mkAfter ''
-        if ! cmp -s ${./builder/builder_ed25519} /etc/nix/builder_ed25519 2>/dev/null; then
-          install -m 600 ${./builder/builder_ed25519} /etc/nix/builder_ed25519
-          install -m 644 ${
+        install -d -m 700 -o ${cfg.user} "${userHome}/.ssh"
+        if ! cmp -s ${./builder/builder_ed25519} "${userBuilderKey}" 2>/dev/null; then
+          install -o ${cfg.user} -m 600 ${./builder/builder_ed25519} "${userBuilderKey}"
+          install -o ${cfg.user} -m 644 ${
             ./builder/builder_ed25519.pub
-          } /etc/nix/builder_ed25519.pub
+          } "${userBuilderPubKey}"
         fi
       '';
 
-      # SSH config for builder alias (port mapping + host key skipping).
-      # nix.buildMachines has no port field, so we use hostName=nix-builder as an
-      # SSH alias. StrictHostKeyChecking=no is needed because the builder generates
-      # a new host key on every container restart.
-      programs.ssh.extraConfig = ''
+      environment.etc."ssh/ssh_config.d/100-nix-apple-container-builder.conf".text = ''
         Host nix-builder
           HostName localhost
           Port ${toString cfg.linuxBuilder.sshPort}
           User root
-          IdentityFile /etc/nix/builder_ed25519
+          IdentityFile ${userBuilderKey}
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null
       '';
@@ -510,7 +533,7 @@ in {
         hostName = "nix-builder";
         protocol = "ssh-ng";
         sshUser = "root";
-        sshKey = "/etc/nix/builder_ed25519";
+        sshKey = userBuilderKey;
         systems = [ "aarch64-linux" ];
         maxJobs = cfg.linuxBuilder.maxJobs;
         speedFactor = cfg.linuxBuilder.speedFactor;
@@ -525,11 +548,15 @@ in {
       (if options ? determinateNix then {
         determinateNix.customSettings = {
           builders =
-            "ssh-ng://nix-builder aarch64-linux /etc/nix/builder_ed25519 ${
+            "ssh-ng://nix-builder aarch64-linux ${userBuilderKey} ${
               toString cfg.linuxBuilder.maxJobs
             } 1 big-parallel - -";
           builders-use-substitutes = true;
         };
+        system.activationScripts.postActivation.text = lib.mkAfter ''
+          launchctl print system/systems.determinate.nix-daemon >/dev/null 2>&1 && \
+            launchctl kickstart -k system/systems.determinate.nix-daemon >/dev/null 2>&1 || true
+        '';
       } else {
         warnings = [
           "nix-apple-container: linuxBuilder.enable is true but neither nix.enable nor the determinateNix module is available. Builder Nix config (buildMachines, distributedBuilds) must be managed manually."

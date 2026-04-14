@@ -239,7 +239,7 @@ Set `enable = false` and rebuild. The module will:
 1. Unload all container launchd agents
 2. Stop the container runtime
 3. Remove runtime state (`~/Library/Application Support/com.apple.container/`) — respects `preserveImagesOnDisable` and `preserveVolumesOnDisable`
-4. Remove builder SSH key (`/etc/nix/builder_ed25519*`) if present
+4. Remove builder SSH key (`~/.ssh/nix-builder_ed25519*`) and legacy `/etc/nix/builder_ed25519*` if present
 5. Clear user preference defaults and `.pkg` install receipts
 
 If you remove the module import entirely (instead of `enable = false`), no cleanup runs. Keep the import with `enable = false` first, rebuild, then remove the import. If you find any lingering artifacts please open an issue.

@@ -112,7 +112,13 @@ fi
 echo "Clearing macOS defaults..."
 defaults delete com.apple.container 2>/dev/null || true
 
-# 7-8. These steps may require sudo
+# 7. Remove current user's builder SSH keys
+if [ -f "$HOME/.ssh/nix-builder_ed25519" ] || [ -f "$HOME/.ssh/nix-builder_ed25519.pub" ]; then
+  echo "Removing builder SSH keys from $HOME/.ssh..."
+  rm -f "$HOME/.ssh/nix-builder_ed25519" "$HOME/.ssh/nix-builder_ed25519.pub"
+fi
+
+# 8-9. These steps may require sudo
 need_sudo=false
 if pkgutil --pkg-info com.apple.container-installer &>/dev/null; then
   need_sudo=true
@@ -126,15 +132,15 @@ if [ "$need_sudo" = true ]; then
   echo "The following steps require administrator privileges:"
 fi
 
-# 7. Forget pkg receipt
+# 8. Forget pkg receipt
 if pkgutil --pkg-info com.apple.container-installer &>/dev/null; then
   echo "Removing package receipt..."
   sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
 fi
 
-# 8. Remove builder SSH keys
+# 9. Remove legacy builder SSH keys
 if [ -f /etc/nix/builder_ed25519 ] || [ -f /etc/nix/builder_ed25519.pub ]; then
-  echo "Removing builder SSH keys..."
+  echo "Removing legacy builder SSH keys..."
   sudo rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
 fi
 
