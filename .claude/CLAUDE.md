@@ -19,7 +19,8 @@ This is a nix-darwin module that wraps Apple's [Containerization](https://github
 - `default.nix` — the nix-darwin module
 - `package.nix` — derivation that extracts the `container` CLI from Apple's signed `.pkg`; accepts overridable `version` and `hash` args
 - `kernel.nix` — fixed-output derivation that fetches the kata-containers kernel tarball via `curl` and extracts the binary; accepts overridable `version` and `hash` args
-- `builder/Dockerfile` — nix-builder image (`FROM nixos/nix:<version>`); the Nix version in the `FROM` line is used as the image tag
+- `builder/Dockerfile` — nix-builder image (`FROM nixos/nix:<version>`)
+- `builder/IMAGE_VERSION` — builder image version series; published tags use `<builder-version>-nix<nix-version>` (e.g. `v2-nix2.34.6`)
 - `builder/builder_ed25519` / `builder/builder_ed25519.pub` — known SSH key pair for the linux builder (intentionally public, same model as nixpkgs' `darwin.linux-builder`)
 - `Makefile` — build/push/release/update targets for the builder image and module
 - `scripts/` — update scripts: `update-container.sh`, `update-kernel.sh`, `update-nix-builder.sh`
@@ -95,26 +96,29 @@ When disabled:
 
 ### Linux builders (linux-builder.aarch64 / linux-builder.x86_64)
 
-Runs `ghcr.io/halfwhey/nix-builder` (based on `nixos/nix`) as Apple containers with sshd, configured as Nix remote builders. Two architectures available: `linux-builder.aarch64` (native) and `linux-builder.x86_64` (`--platform linux/amd64`). Each is independently enabled. Both share the same multi-arch image (`linux-builder.image`) and SSH key pair committed to the repo (same security model as nixpkgs' `darwin.linux-builder` -- builder only listens on localhost).
+Runs `ghcr.io/halfwhey/nix-builder` (based on `nixos/nix`) as Apple containers with sshd, configured as Nix remote builders. Two architectures available: `linux-builder.aarch64` (native) and `linux-builder.x86_64` (`--platform linux/amd64`). Each is independently enabled. Both share the same multi-arch image (`linux-builder.image`) and SSH key pair committed to the repo (same security model as nixpkgs' `darwin.linux-builder` -- builder only listens on localhost). Each builder also has a per-container `kernel` option wired to `container run --kernel`; `linux-builder.x86_64.kernel` defaults to a Rosetta-compatible Kata 3.24.0 kernel, while `linux-builder.aarch64.kernel = null` uses the runtime default kernel.
 
-Container names always include the platform: `nix-builder-aarch64`, `nix-builder-x86_64`. SSH aliases match the container names.
+Container names always include a URI-safe platform suffix: `nix-builder-aarch64`, `nix-builder-amd64`. SSH aliases match the container names. The option path remains `linux-builder.x86_64` — `x86_64` is valid Nix syntax — but the runtime name avoids underscores because the machine-spec/store-URI hostname field should avoid them.
+
+The builder image must persist both `sandbox = false` and `filter-syscalls = false` in `/etc/nix/nix.conf`. Setting `filter-syscalls = false` only on one-off image build commands is not enough — remote builds can still fail during environment setup with `unable to load seccomp BPF program: Invalid argument`, especially on the amd64/Rosetta path.
 
 The old `linuxBuilder.*` option names are deprecated but still work via `mkRenamedOptionModule` (7 entries in `imports`). They map to `linux-builder.aarch64.*` (per-arch options) and `linux-builder.image` (shared).
 
-The default image tag in `default.nix` (`services.containerization.linux-builder.image`) tracks the Nix version used in the Dockerfile (e.g. `2.34.3`), not `:latest`. It is bumped automatically by `build-builder.yml` after each successful image push. The CI regex (`s|ghcr.io/halfwhey/nix-builder:[^"]*|...|`) matches the string literal in the option default value.
+The default image tag in `default.nix` (`services.containerization.linux-builder.image`) uses `<builder-version>-nix<nix-version>` (e.g. `v2-nix2.34.6`), not `:latest`. `builder/IMAGE_VERSION` is bumped manually when the builder image semantics change; the nix-version suffix is bumped automatically by `build-builder.yml` when the `nixos/nix` base image changes. The CI regex (`s|ghcr.io/halfwhey/nix-builder:[^"]*|...|`) matches the string literal in the option default value.
 
-Users can override the image via `services.containerization.linux-builder.image = "ghcr.io/halfwhey/nix-builder:2.34.3"`.
+Users can override the image via `services.containerization.linux-builder.image = "ghcr.io/halfwhey/nix-builder:v2-nix2.34.6"`.
 
 Implementation structure in `default.nix`:
 - `builderCfg = cfg."linux-builder"` and `anyBuilderEnabled` helpers in the `let` block
+- `defaultKernel` (runtime default) and `rosettaCompatKernel` (x86_64 builder-only) helpers in the `let` block
 - Shared block (SSH key install): `lib.mkIf (cfg.enable && anyBuilderEnabled)`
 - Per-arch blocks (container, SSH config, `nix.buildMachines`): `lib.mkIf (cfg.enable && builderCfg.<arch>.enable)`
 - Port conflict assertion: `lib.mkIf` both enabled, asserts ports differ
-- Determinate Nix `builders` is a scalar string, so both lines are conditionally built via `lib.optional` inside one block using `lib.concatStringsSep "\\n"`
+- Determinate Nix uses `determinateNix.buildMachines` directly, mirroring the plain `nix.buildMachines` data instead of hand-serializing `builders`
 
 Builder config uses backend-specific declarative options when possible:
 - When `config.nix.enable = true` (plain nix-darwin): sets `nix.buildMachines`, `nix.distributedBuilds`, `nix.settings.builders-use-substitutes` declaratively. nix-darwin writes the files and handles daemon restarts.
-- When `config.nix.enable = false` (Determinate Nix): sets `determinateNix.customSettings` declaratively.
+- When `config.nix.enable = false` (Determinate Nix): sets `determinateNix.buildMachines`, `determinateNix.distributedBuilds`, and `determinateNix.customSettings.builders-use-substitutes` declaratively.
 - In all backends: SSH key (`/etc/nix/builder_ed25519`) is installed imperatively (needs 0600 perms). SSH config uses `programs.ssh.extraConfig` declaratively. SSH config is needed because `nix.buildMachines` has no port field (we use `hostName = "nix-builder-<arch>"` as SSH aliases) and `StrictHostKeyChecking no` is required (builder generates a new host key on every restart).
 
 When all builders disabled: removes `/etc/nix/builder_ed25519*`. Containers removed by reconciliation. Declarative `nix.buildMachines`, `programs.ssh.extraConfig`, and `determinateNix.customSettings` are cleared automatically by nix-darwin when `lib.mkIf` conditions become false.
@@ -156,7 +160,7 @@ Every feature that creates state outside the Nix store MUST clean it up when dis
 |-----------|--------------|----------------------|
 | Module (`enable`) | `~/Library/Application Support/com.apple.container/`, defaults, pkg receipt | Teardown block with `!cfg.enable` guard; selective cleanup based on `preserveImagesOnDisable` and `preserveVolumesOnDisable`; also removes builder files |
 | Containers (`autoStart`) | Launchd agents (`dev.apple.container.*.plist`), running container VMs | postActivation reconciliation unloads agents + stops/removes containers; teardown also unloads agents before system stop |
-| Linux builders (`linux-builder.{aarch64,x86_64}.enable`) | `/etc/nix/builder_ed25519*`, `programs.ssh.extraConfig`, `nix.buildMachines` (declarative), `determinateNix.customSettings` (Determinate), containers `nix-builder-{aarch64,x86_64}` | `!anyBuilderEnabled` block removes SSH key; containers removed by reconciliation; declarative options cleared by nix-darwin |
+| Linux builders (`linux-builder.{aarch64,x86_64}.enable`) | `/etc/nix/builder_ed25519*`, `programs.ssh.extraConfig`, `nix.buildMachines` (declarative), `determinateNix.customSettings` (Determinate), containers `nix-builder-aarch64` / `nix-builder-amd64` | `!anyBuilderEnabled` block removes SSH key; containers removed by reconciliation; declarative options cleared by nix-darwin |
 | Kernel | Symlinks in `$APP_SUPPORT/kernels/` pointing to Nix store | Removed with kernels dir on teardown (always cleaned); binary in Nix store protected by system profile |
 | Images (`images.*`) | Images loaded into runtime's own storage via `container image load` | Removed with `content/` unless `preserveImagesOnDisable = true` |
 | Mount directories (`autoCreateMounts`) | Host directories for volumes (absolute paths only) | NOT cleaned up (user data, intentionally preserved) |
@@ -205,7 +209,7 @@ If the `container` CLI was previously run from a different install path (e.g., a
 The module handles this automatically in preActivation: before checking `system status`, it inspects the registered apiserver binary path via `launchctl print`. If the binary no longer exists (stale store path), it bootouts the service so `system start` can re-register with the current binary. This makes package upgrades (version bumps in `package.nix`) safe — the old store path is deregistered before the new CLI tries to use it.
 
 ### Kernel install prompt
-`container system start` prompts interactively: "Install the recommended default kernel from [URL]? [Y/n]:". This hangs non-interactive environments. The module uses `--disable-kernel-install` on `system start` and manages the kernel declaratively — `kernel.nix` extracts the binary into the Nix store, and the activation script symlinks it into the runtime's `kernels/` directory.
+`container system start` prompts interactively: "Install the recommended default kernel from [URL]? [Y/n]:". This hangs non-interactive environments. The module uses `--disable-kernel-install` on `system start` and manages the runtime default kernel declaratively — `kernel.nix` extracts the binary into the Nix store, and the activation script symlinks it into the runtime's `kernels/` directory. Individual containers can still override this with `container run --kernel`; the x86_64 Nix builder uses that hook to pin a Rosetta-compatible kernel.
 
 ## Apple Containerization quirks
 
@@ -213,7 +217,7 @@ The module handles this automatically in preActivation: before checking `system 
 Unlike Docker (single VM hosting all containers), each container runs in its own lightweight VM with a dedicated Linux kernel. The framework provides the kernel (kata-containers) and a Swift-based init system (vminitd) as PID 1.
 
 ### Kernel source
-The Linux kernel comes from [kata-containers](https://github.com/kata-containers/kata-containers/releases). `kernel.nix` is a fixed-output `stdenv.mkDerivation` that fetches the release tarball via `curl` in `buildCommand`, extracts the kernel binary via the `vmlinux.container` symlink, and stores just the binary (~16MB) in the Nix store. The activation script symlinks it into `~/Library/Application Support/com.apple.container/kernels/` with a `default.kernel-arm64` symlink.
+The Linux kernel comes from [kata-containers](https://github.com/kata-containers/kata-containers/releases). `kernel.nix` is a fixed-output `stdenv.mkDerivation` that fetches the release tarball via `curl` in `buildCommand`, extracts the kernel binary via the `vmlinux.container` symlink, and stores just the binary (~16MB) in the Nix store. The activation script symlinks the runtime default kernel into `~/Library/Application Support/com.apple.container/kernels/` with a `default.kernel-arm64` symlink, while the x86_64 builder passes its own kernel path directly via `--kernel`.
 
 `kernel.nix` accepts `version` and `hash` as overridable function arguments (defaults to the pinned version). Users can call `pkgs.callPackage "${inputs.nix-apple-container}/kernel.nix" { version = "..."; hash = "..."; }` to use a different release without forking the module. Same pattern applies to `package.nix` for the container CLI.
 

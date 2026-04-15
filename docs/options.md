@@ -17,6 +17,9 @@
 |--------|------|---------|-------------|
 | *(top-level)* | package | *kata 3.26.0 arm64* | Flat file derivation of the kernel binary — symlinked as `default.kernel-arm64` in the runtime |
 
+The runtime default kernel is separate from the per-builder kernel used by
+`linux-builder.<arch>.kernel`.
+
 ## `services.containerization.containers.<name>`
 
 | Option | Type | Default | Description |
@@ -41,13 +44,13 @@
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `image` | string | `"ghcr.io/halfwhey/nix-builder:<version>"` | Builder container image (multi-arch, shared by aarch64 and x86_64) |
+| `image` | string | `"ghcr.io/halfwhey/nix-builder:<builder-version>-nix<version>"` | Builder container image (multi-arch, shared by aarch64 and x86_64) |
 
 The default image (`ghcr.io/halfwhey/nix-builder`) is built from the `builder/Dockerfile` in this repo -- a minimal `nixos/nix` image with sshd. Uses a known SSH key pair (builder only listens on localhost, same security model as nixpkgs' `darwin.linux-builder`).
 
 Builder Nix configuration is fully declarative:
 - **`nix.enable = true`** (plain nix-darwin): uses `nix.buildMachines`, `nix.distributedBuilds`, and `nix.settings`.
-- **Determinate Nix**: uses `determinateNix.customSettings`. Note: `builders` is a single string setting -- if another module also sets `determinateNix.customSettings.builders`, they will conflict. Requires the [Determinate nix-darwin module](https://docs.determinate.systems/guides/nix-darwin/):
+- **Determinate Nix**: uses `determinateNix.buildMachines`, `determinateNix.distributedBuilds`, and `determinateNix.customSettings.builders-use-substitutes`. Requires the [Determinate nix-darwin module](https://docs.determinate.systems/guides/nix-darwin/):
 
   <details>
   <summary>Determinate Nix flake setup</summary>
@@ -91,6 +94,7 @@ Builder Nix configuration is fully declarative:
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Run a Nix builder container for aarch64-linux builds |
 | `cores` | int | `4` | Number of CPUs to allocate to the container |
+| `kernel` | null or package | `null` | Kernel passed to this builder via `container run --kernel`. `null` uses the runtime default kernel |
 | `memory` | string | `"1024M"` | Amount of memory to allocate to the container |
 | `sshPort` | port | `31022` | Host port for SSH to the builder |
 | `maxJobs` | int | `4` | Max parallel build jobs |
@@ -102,9 +106,10 @@ Builder Nix configuration is fully declarative:
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Run a builder container for x86_64-linux builds |
 | `cores` | int | `4` | Number of CPUs to allocate to the x86_64 builder container |
+| `kernel` | null or package | *kata 3.24.0 arm64* | Kernel passed to this builder via `container run --kernel`. Defaults to a Rosetta-compatible kernel |
 | `memory` | string | `"1024M"` | Amount of memory to allocate to the x86_64 builder container |
 | `sshPort` | port | `31023` | Host port for SSH to the x86_64 builder |
 | `maxJobs` | int | `4` | Max parallel build jobs |
 | `speedFactor` | int | `1` | Relative speed of the x86_64 builder |
 
-Both builders share the same image and SSH key. The x86_64 builder runs with `--platform linux/amd64`. Performance is lower than native aarch64 builds but enables building `x86_64-linux` derivations without a separate x86 machine.
+Both builders share the same image and SSH key. The x86_64 builder runs with `--platform linux/amd64`, uses the runtime name `nix-builder-amd64`, and uses a dedicated Rosetta-compatible kernel by default. Performance is lower than native aarch64 builds but enables building `x86_64-linux` derivations without a separate x86 machine.

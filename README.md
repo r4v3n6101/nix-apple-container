@@ -21,6 +21,7 @@ A nix-darwin module for declaratively managing [Apple Containerization][apple-co
 - Containers are addressable by name from the host and from other containers (e.g. `foo.test` for a container named `foo`)
 - Auto-creates host directories for volume mounts
 - Optional Linux builder containers for building `aarch64-linux` and `x86_64-linux` derivations on macOS
+- Uses a dedicated Rosetta-compatible kernel for the `x86_64` builder by default
 - Reconciles running containers against config — removes undeclared containers and their launchd agents
 - Builds and loads Nix-built OCI images via [nix2container][nix2container] — no tarballs in the Nix store
 
@@ -149,6 +150,15 @@ services.containerization = {
 };
 ```
 
+The runtime default kernel (`services.containerization.kernel`) is separate from
+the per-builder kernel used by `linux-builder.<arch>.kernel`. By default,
+`linux-builder.x86_64.kernel` is pinned to Kata `3.24.0` and passed via
+`container run --kernel` to avoid Rosetta regressions with newer kernels.
+
+The builder image tag is versioned independently from the base `nixos/nix`
+version. Tags use the form `<builder-version>-nix<nix-version>`, for example
+`v2-nix2.34.6`.
+
 For a fully custom kernel (different source or extraction logic), pass any flat-file derivation to `kernel`:
 
 ```nix
@@ -231,7 +241,19 @@ services.containerization = {
 };
 ```
 
-Each architecture runs its own builder container. Both share the same multi-arch image and SSH key. The x86_64 builder listens on port 31023 by default (configurable via `linux-builder.x86_64.sshPort`).
+Each architecture runs its own builder container. Both share the same multi-arch image and SSH key. The `x86_64` builder uses the runtime name `nix-builder-amd64` and listens on port 31023 by default (configurable via `linux-builder.x86_64.sshPort`).
+
+The x86_64 builder also has its own per-container kernel option:
+
+```nix
+services.containerization.linux-builder.x86_64.kernel =
+  pkgs.callPackage "${inputs.nix-apple-container}/kernel.nix" {
+    version = "3.24.0";
+    hash = "sha256-2pNP+CBvV4DBAeGiwIe8MpdasjcDhc9L2tcRArP7ANw=";
+  };
+```
+
+Set it to `null` to use the runtime default kernel instead.
 
 ### Registry images
 
