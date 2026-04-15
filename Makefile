@@ -1,4 +1,6 @@
 NIX_VERSION       ?= $(shell sed -n 's/^FROM nixos\/nix:\(.*\)/\1/p' builder/Dockerfile)
+BUILDER_VERSION   ?= $(shell tr -d '\n' < builder/IMAGE_VERSION)
+IMAGE_TAG         := $(BUILDER_VERSION)-nix$(NIX_VERSION)
 CONTAINER_VERSION ?= $(shell sed -n 's/.*version = "\(.*\)".*/\1/p' package.nix | head -1)
 IMAGE             := ghcr.io/halfwhey/nix-builder
 
@@ -20,13 +22,13 @@ release: _require_new_version ## Commit VERSION, push, create GitHub release (NE
 .PHONY: build
 build: ## Build the builder image locally (multi-arch)
 	docker buildx build --platform linux/amd64,linux/arm64 \
-		-t $(IMAGE):latest -t $(IMAGE):$(NIX_VERSION) \
+		-t $(IMAGE):latest -t $(IMAGE):$(IMAGE_TAG) \
 		builder/
 
 .PHONY: push
 push: ## Build and push the builder image to ghcr.io
 	docker buildx build --platform linux/amd64,linux/arm64 \
-		-t $(IMAGE):latest -t $(IMAGE):$(NIX_VERSION) \
+		-t $(IMAGE):latest -t $(IMAGE):$(IMAGE_TAG) \
 		--push builder/
 
 .PHONY: ci
@@ -50,12 +52,19 @@ update-nix-builder: ## Check and update nixos/nix base image to latest release
 	@scripts/update-nix-builder.sh
 
 .PHONY: bump-linux-builder
-bump-linux-builder: ## Bump linuxBuilder default image in default.nix to current NIX_VERSION
-	perl -i -pe 's|ghcr.io/halfwhey/nix-builder:[^"]*|ghcr.io/halfwhey/nix-builder:$(NIX_VERSION)|' default.nix
+bump-linux-builder: ## Bump linuxBuilder default image in default.nix to current IMAGE_TAG
+	perl -i -pe 's|ghcr.io/halfwhey/nix-builder:[^"]*|ghcr.io/halfwhey/nix-builder:$(IMAGE_TAG)|' default.nix
 	git add default.nix
-	git diff --cached --quiet || git commit -m "chore: bump linuxBuilder default to $(NIX_VERSION)"
+	git diff --cached --quiet || git commit -m "chore: bump linuxBuilder default to $(IMAGE_TAG)"
+	git push origin master
+
+.PHONY: bump-builder-image-version
+bump-builder-image-version: _require_new_version ## Bump builder image version series (NEW_VERSION=v2)
+	printf '%s\n' "$(NEW_VERSION)" > builder/IMAGE_VERSION
+	git add builder/IMAGE_VERSION
+	git diff --cached --quiet || git commit -m "chore: bump builder image version to $(NEW_VERSION)"
 	git push origin master
 
 .PHONY: clean
 clean: ## Remove local builder images
-	docker rmi $(IMAGE):latest $(IMAGE):$(NIX_VERSION) 2>/dev/null || true
+	docker rmi $(IMAGE):latest $(IMAGE):$(IMAGE_TAG) 2>/dev/null || true

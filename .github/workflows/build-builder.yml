@@ -25,7 +25,9 @@ jobs:
       - name: Check version
         id: versions
         run: |
+          IMAGE_VERSION=$(tr -d '\n' < builder/IMAGE_VERSION)
           CURRENT=$(sed -n 's/^FROM nixos\/nix:\(.*\)/\1/p' builder/Dockerfile)
+          echo "image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
           echo "current=$CURRENT" >> $GITHUB_OUTPUT
           if [ "${{ github.event_name }}" = "schedule" ]; then
             LATEST=$(curl -s "https://hub.docker.com/v2/repositories/nixos/nix/tags?page_size=100" \
@@ -38,6 +40,7 @@ jobs:
             echo "latest=$CURRENT" >> $GITHUB_OUTPUT
             echo "proceed=true" >> $GITHUB_OUTPUT
           fi
+          echo "tag=${IMAGE_VERSION}-nix${LATEST:-$CURRENT}" >> $GITHUB_OUTPUT
 
       - name: Already up to date
         if: github.event_name == 'schedule' && steps.versions.outputs.proceed == 'false'
@@ -68,11 +71,11 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ steps.versions.outputs.latest }}
+            ${{ env.IMAGE }}:${{ steps.versions.outputs.tag }}
 
       - name: Update default.nix
         if: steps.versions.outputs.proceed == 'true'
-        run: perl -i -pe 's|ghcr.io/halfwhey/nix-builder:[^"]*|ghcr.io/halfwhey/nix-builder:${{ steps.versions.outputs.latest }}|' default.nix
+        run: perl -i -pe 's|ghcr.io/halfwhey/nix-builder:[^"]*|ghcr.io/halfwhey/nix-builder:${{ steps.versions.outputs.tag }}|' default.nix
 
       - name: Commit and push
         if: steps.versions.outputs.proceed == 'true'
@@ -84,5 +87,5 @@ jobs:
           else
             git add default.nix
           fi
-          git diff --cached --quiet || git commit -m "chore: bump nix-builder to ${{ steps.versions.outputs.latest }}"
+          git diff --cached --quiet || git commit -m "chore: bump nix-builder to ${{ steps.versions.outputs.tag }}"
           git push origin master

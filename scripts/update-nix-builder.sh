@@ -2,6 +2,10 @@
 set -euo pipefail
 
 # Update nixos/nix base image to the latest release
+#
+# Note: the published builder tag is derived from builder/IMAGE_VERSION plus
+# this base image version (e.g. v1-nix2.34.6). This script only updates the
+# base nix version in builder/Dockerfile.
 
 CURRENT=$(sed -n 's/^FROM nixos\/nix:\(.*\)/\1/p' builder/Dockerfile)
 LATEST=$(curl -s "https://hub.docker.com/v2/repositories/nixos/nix/tags?page_size=100" \
