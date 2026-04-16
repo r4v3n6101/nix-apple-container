@@ -259,28 +259,18 @@ let
   nixImagePaths = lib.mapAttrs' (_: r: lib.nameValuePair r.imageRef "${r.copyTo}") resolvedImages;
 
   appSupport = "${userHome}/Library/Application Support/com.apple.container";
-  agentDir = "${userHome}/Library/LaunchAgents";
+  legacyAgentDir = "${userHome}/Library/LaunchAgents";
+  runtimeLabel = "nix-apple-container.runtime";
   userBuilderKey = "${userHome}/.ssh/nix-builder_ed25519";
   userBuilderPubKey = "${userHome}/.ssh/nix-builder_ed25519.pub";
 
-  # Unload and remove module-owned launchd agents.
-  # If declaredAgents is empty, unloads ALL agents (teardown).
-  # Otherwise, unloads only agents not in the declared list (reconciliation).
-  mkAgentUnloadScript = declaredAgents: ''
+  cleanupLegacyUserAgents = ''
     CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
-    if [ -n "$CONTAINER_UID" ] && [ -d "${agentDir}" ]; then
-      for plist in "${agentDir}"/dev.apple.container.*.plist; do
+    if [ -n "$CONTAINER_UID" ] && [ -d "${legacyAgentDir}" ]; then
+      for plist in "${legacyAgentDir}"/dev.apple.container.*.plist; do
         [ -f "$plist" ] || continue
         agent_name="$(basename "$plist" .plist)"
-        ${lib.optionalString (declaredAgents != "") ''
-          KEEP=false
-          # shellcheck disable=SC2043
-          for d in ${declaredAgents}; do
-            if [ "$agent_name" = "$d" ]; then KEEP=true; break; fi
-          done
-          if [ "$KEEP" = "true" ]; then continue; fi
-        ''}
-        echo "nix-apple-container: unloading agent $agent_name..."
+        echo "nix-apple-container: removing legacy user agent $agent_name..."
         launchctl asuser "$CONTAINER_UID" sudo --user="${cfg.user}" -- launchctl unload "$plist" 2>/dev/null || true
         sudo --user="${cfg.user}" -- rm -f "$plist"
       done
@@ -394,6 +384,9 @@ let
       ++ c.cmd;
     in
     pkgs.writeShellScript "container-run-${name}" ''
+      if [ "$(id -un)" != "${cfg.user}" ]; then
+        exit 0
+      fi
       ${lib.optionalString (nixImagePath != null) "# nix-image: ${nixImagePath}"}
       ${bin} stop ${lib.escapeShellArg name} 2>/dev/null || true
       ${bin} rm ${lib.escapeShellArg name} 2>/dev/null || true
@@ -495,9 +488,7 @@ in
       # Teardown: runs when module is disabled (guarded — only if state exists)
       (lib.mkIf (!cfg.enable) {
         system.activationScripts.postActivation.text = lib.mkAfter ''
-          # Unload agents even if APP_SUPPORT was manually deleted — agents
-          # are plist files in ~/Library/LaunchAgents, not inside APP_SUPPORT.
-          ${mkAgentUnloadScript ""}
+          ${cleanupLegacyUserAgents}
 
           APP_SUPPORT="${userHome}/Library/Application Support/com.apple.container"
 
@@ -567,14 +558,43 @@ in
           };
         };
 
-        launchd.user.agents = lib.mapAttrs' (
+        launchd.agents = {
+          container-runtime = {
+            serviceConfig = {
+              Label = runtimeLabel;
+              ProgramArguments = [
+                (toString (
+                  pkgs.writeShellScript "container-runtime-start" ''
+                    if [ "$(id -un)" != "${cfg.user}" ]; then
+                      exit 0
+                    fi
+                    exec ${bin} system start --disable-kernel-install
+                  ''
+                ))
+              ];
+              LimitLoadToSessionType = [ "Background" ];
+              RunAtLoad = true;
+              KeepAlive = {
+                SuccessfulExit = false;
+              };
+              StandardOutPath = "${userHome}/Library/Logs/container-runtime.log";
+              StandardErrorPath = "${userHome}/Library/Logs/container-runtime.err";
+            };
+          };
+        }
+        // lib.mapAttrs' (
           name: c:
           lib.nameValuePair "container-${name}" {
             serviceConfig = {
               Label = "dev.apple.container.${name}";
               ProgramArguments = [ (toString (mkContainerRunScript name c)) ];
-              RunAtLoad = true;
-              KeepAlive = true;
+              LimitLoadToSessionType = [ "Background" ];
+              RunAtLoad = false;
+              KeepAlive = {
+                OtherJobEnabled = {
+                  "com.apple.container.apiserver" = true;
+                };
+              };
               StandardOutPath = "${userHome}/Library/Logs/container-${name}.log";
               StandardErrorPath = "${userHome}/Library/Logs/container-${name}.err";
             };
@@ -625,41 +645,25 @@ in
           ]
         );
 
-        # Reconcile containers: unload stale launchd agents, then stop+rm undeclared containers.
-        # We must unload agents ourselves because nix-darwin's userLaunchd script is conditional
-        # on having user agents in the NEW config — if all containers are removed, it never runs
-        # and old agents with KeepAlive=true keep restarting containers.
-        system.activationScripts.postActivation.text = lib.mkAfter (
-          let
-            # Plist filenames are based on serviceConfig.Label, not the attribute name
-            declaredAgentNames = lib.concatStringsSep " " (
-              map (n: "dev.apple.container.${n}") (lib.attrNames autoStartContainers)
-            );
-          in
-          ''
-            echo "nix-apple-container: reconciling containers..."
+        # Reconcile containers: stop+rm undeclared containers.
+        system.activationScripts.postActivation.text = lib.mkAfter ''
+          echo "nix-apple-container: reconciling containers..."
+          ${cleanupLegacyUserAgents}
 
-            # Unload and remove stale launchd agents before stopping containers.
-            # nix-darwin's userLaunchd cleanup is conditional on having agents in the
-            # new config — if all containers are removed, it skips cleanup entirely.
-            ${mkAgentUnloadScript declaredAgentNames}
-
-            # Now stop and remove containers not declared in config
-            DECLARED="${lib.concatStringsSep " " (lib.attrNames cfg.containers)}"
-            for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${pkgs.jq}/bin/jq -r '.[].configuration.id // empty' 2>/dev/null); do
-              KEEP=false
-              for d in $DECLARED; do
-                if [ "$cid" = "$d" ]; then KEEP=true; break; fi
-              done
-              if [ "$KEEP" = "false" ]; then
-                echo "nix-apple-container: stopping undeclared container $cid..."
-                ${runAs} ${bin} stop "$cid" 2>/dev/null || true
-                ${runAs} ${bin} rm "$cid" 2>/dev/null || true
-              fi
+          # Now stop and remove containers not declared in config
+          DECLARED="${lib.concatStringsSep " " (lib.attrNames cfg.containers)}"
+          for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${pkgs.jq}/bin/jq -r '.[].configuration.id // empty' 2>/dev/null); do
+            KEEP=false
+            for d in $DECLARED; do
+              if [ "$cid" = "$d" ]; then KEEP=true; break; fi
             done
-
-          ''
-        );
+            if [ "$KEEP" = "false" ]; then
+              echo "nix-apple-container: stopping undeclared container $cid..."
+              ${runAs} ${bin} stop "$cid" 2>/dev/null || true
+              ${runAs} ${bin} rm "$cid" 2>/dev/null || true
+            fi
+          done
+        '';
 
         system.activationScripts.etc.text = lib.mkAfter ''
           if [ -e /etc/resolver/containerization.test.before-nix-darwin ]; then
