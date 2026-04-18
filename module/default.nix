@@ -6,15 +6,21 @@
 }:
 
 let
+  common = import ./common.nix { inherit config; };
   cfg = config.services.containerization;
+  inherit (common)
+    launchAgentsDir
+    resolverRelativePath
+    runtimeLabel
+    systemBuilderKey
+    systemBuilderPubKey
+    userBuilderKey
+    userBuilderPubKey
+    userHome
+    ;
   bin = lib.getExe cfg.package;
+  jq = "${pkgs.jq}/bin/jq";
   runAs = "sudo -u ${cfg.user} --";
-
-  userHome =
-    if config.users.users ? ${cfg.user} then
-      config.users.users.${cfg.user}.home
-    else
-      "/Users/${cfg.user}";
 
   # Resolve nix2container image metadata (keyed by attr name)
   resolvedImages = lib.mapAttrs (name: img: {
@@ -29,12 +35,170 @@ let
   nixImagePaths = lib.mapAttrs' (_: r: lib.nameValuePair r.imageRef "${r.copyTo}") resolvedImages;
 
   appSupport = "${userHome}/Library/Application Support/com.apple.container";
-  runtimeLabel = "nix-apple-container.runtime";
-  userBuilderKey = "${userHome}/.ssh/nix-builder_ed25519";
-  userBuilderPubKey = "${userHome}/.ssh/nix-builder_ed25519.pub";
+  managedAgentDir = launchAgentsDir;
+  runtimeAgentPath = "${managedAgentDir}/${runtimeLabel}.plist";
+  logContextVar = "NAC_LOG_CONTEXT";
+
+  userDomainLoop = uidExpr: body: ''
+    for domain in "gui/${uidExpr}" "user/${uidExpr}"; do
+      ${body}
+    done
+  '';
+
+  bootoutManagedLabelsScript = logCommand: ''
+    ${userDomainLoop "$CONTAINER_UID" ''
+      launchctl print "$domain" >/dev/null 2>&1 || continue
+      launchctl print "$domain" 2>/dev/null \
+        | awk '/^[[:space:]]*dev\.apple\.container\.[^[:space:]]+[[:space:]]*=/{print $1}' \
+        | while IFS= read -r label; do
+            [ -n "$label" ] || continue
+            ${logCommand}
+            launchctl bootout "$domain/$label" 2>/dev/null || true
+          done
+    ''}
+  '';
+
+  mkShellLogging = context: ''
+    : "''${${logContextVar}:=${context}}"
+
+    nac_timestamp() {
+      /bin/date '+%Y-%m-%dT%H:%M:%S%z'
+    }
+
+    nac_log() {
+      if [ -n "''${NAC_LOG_CAPTURE_INITIALIZED:-}" ]; then
+        printf '%s [%s] %s\n' "$(nac_timestamp)" "$NAC_LOG_CONTEXT" "$*" >&4
+      else
+        printf '%s [%s] %s\n' "$(nac_timestamp)" "$NAC_LOG_CONTEXT" "$*" >&2
+      fi
+    }
+
+    nac_capture_streams() {
+      if [ -n "''${NAC_LOG_CAPTURE_INITIALIZED:-}" ]; then
+        return 0
+      fi
+
+      NAC_LOG_CAPTURE_INITIALIZED=1
+      exec 3>&1 4>&2
+      exec > >(
+        while IFS= read -r line || [ -n "$line" ]; do
+          printf '%s [%s][stdout] %s\n' "$(/bin/date '+%Y-%m-%dT%H:%M:%S%z')" "$NAC_LOG_CONTEXT" "$line" >&3
+        done
+      )
+      exec 2> >(
+        while IFS= read -r line || [ -n "$line" ]; do
+          printf '%s [%s][stderr] %s\n' "$(/bin/date '+%Y-%m-%dT%H:%M:%S%z')" "$NAC_LOG_CONTEXT" "$line" >&4
+        done
+      )
+    }
+
+    nac_capture_streams
+    nac_log "script start pid=$$"
+    trap 'status=$?; nac_log "script exit status=$status"' EXIT
+    trap 'nac_log "received SIGHUP"; exit 129' HUP
+    trap 'nac_log "received SIGINT"; exit 130' INT
+    trap 'nac_log "received SIGQUIT"; exit 131' QUIT
+    trap 'nac_log "received SIGTERM"; exit 143' TERM
+    trap 'nac_log "received SIGABRT"; exit 134' ABRT
+  '';
 
   autoStartContainers = lib.filterAttrs (_: c: c.autoStart) cfg.containers;
+  bootstrapManagedContainersScript = pkgs.writeShellScript "bootstrap-managed-containers" ''
+    ${mkShellLogging "bootstrap-managed-containers"}
 
+    set -e -o pipefail
+
+    for cmd in awk basename id launchctl mkdir rm sudo; do
+      command -v "$cmd" >/dev/null 2>&1 || {
+        nac_log "'$cmd' is required but not found in PATH"
+        exit 1
+      }
+    done
+
+    CURRENT_USER=$(id -un 2>/dev/null || echo "")
+    CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
+    if [ -z "$CONTAINER_UID" ]; then
+      nac_log "could not resolve uid for ${cfg.user}"
+      exit 1
+    fi
+
+    CONTAINER_MANAGER=$(launchctl managername 2>/dev/null || echo "")
+    CONTAINER_DOMAIN=""
+    case "$CONTAINER_MANAGER" in
+      Aqua)
+        CONTAINER_DOMAIN="gui/$CONTAINER_UID"
+        ;;
+      Background)
+        CONTAINER_DOMAIN="user/$CONTAINER_UID"
+        ;;
+      *)
+        if launchctl print "user/$CONTAINER_UID" >/dev/null 2>&1; then
+          CONTAINER_DOMAIN="user/$CONTAINER_UID"
+        elif launchctl print "gui/$CONTAINER_UID" >/dev/null 2>&1; then
+          CONTAINER_DOMAIN="gui/$CONTAINER_UID"
+        fi
+        ;;
+    esac
+
+    if [ -z "$CONTAINER_DOMAIN" ]; then
+      if [ "$CURRENT_USER" = "${cfg.user}" ]; then
+        nac_log "could not determine a user launchd domain for uid $CONTAINER_UID while running as ${cfg.user}; failing so launchd can retry"
+        exit 1
+      fi
+      nac_log "no user launchd domain for uid $CONTAINER_UID yet; deferring managed container bootstrap until the first ${cfg.user} session"
+      exit 0
+    fi
+
+    CONTAINER_MANAGER_DISPLAY="$CONTAINER_MANAGER"
+    if [ -z "$CONTAINER_MANAGER_DISPLAY" ]; then
+      CONTAINER_MANAGER_DISPLAY="unknown"
+    fi
+
+    nac_log "resolved launchd manager='$CONTAINER_MANAGER_DISPLAY' domain='$CONTAINER_DOMAIN' user='${cfg.user}'"
+    mkdir -p "${appSupport}"
+
+    run_container() {
+      if [ "$(id -un)" = "${cfg.user}" ]; then
+        "$@"
+      else
+        sudo -u "${cfg.user}" -- "$@"
+      fi
+    }
+
+    if run_container ${bin} system status >/dev/null 2>&1; then
+      nac_log "runtime already running"
+    else
+      nac_log "runtime not running; starting with 'container system start --disable-kernel-install'"
+      if run_container ${bin} system start --disable-kernel-install; then
+        nac_log "runtime start command completed"
+      else
+        status=$?
+        nac_log "runtime start failed with status $status"
+        exit "$status"
+      fi
+    fi
+
+    launchctl enable "$CONTAINER_DOMAIN/${runtimeLabel}" >/dev/null 2>&1 || true
+
+    ${bootoutManagedLabelsScript ''nac_log "booting out stale managed label '$label' from '$domain'"''}
+
+    found_managed_plist=0
+    for plist in "${managedAgentDir}"/dev.apple.container.*.plist; do
+      [ -f "$plist" ] || continue
+      found_managed_plist=1
+      label="$(basename "$plist" .plist)"
+      nac_log "bootstrapping '$label' from '$plist' into '$CONTAINER_DOMAIN'"
+      launchctl enable "$CONTAINER_DOMAIN/$label" >/dev/null 2>&1 || true
+      launchctl bootstrap "$CONTAINER_DOMAIN" "$plist"
+      nac_log "bootstrapped '$label' successfully"
+    done
+
+    if [ "$found_managed_plist" -eq 0 ]; then
+      nac_log "no managed container plists found in ${managedAgentDir}"
+    fi
+
+    nac_log "bootstrap-managed-containers completed"
+  '';
   # Extract host paths from volume strings (host:container) for containers with autoCreateMounts
   mkMountDirsScript = lib.concatStrings (
     lib.mapAttrsToList (
@@ -69,9 +233,9 @@ let
         ''
           TMPDIR=$(mktemp -d)
           "${r.copyTo}/bin/copy-to" "oci:$TMPDIR:${r.imageName}:${r.imageTag}"
-          EXPECTED_DIGEST=$(${pkgs.jq}/bin/jq -r '.manifests[0].digest' "$TMPDIR/index.json")
+          EXPECTED_DIGEST=$(${jq} -r '.manifests[0].digest' "$TMPDIR/index.json")
           CURRENT_DIGEST=$(${runAs} ${bin} image inspect "${r.imageRef}" 2>/dev/null \
-            | ${pkgs.jq}/bin/jq -r '.[].index.digest' 2>/dev/null || echo "")
+            | ${jq} -r '.[].index.digest' 2>/dev/null || echo "")
           if [ "$EXPECTED_DIGEST" = "$CURRENT_DIGEST" ]; then
             echo "nix-apple-container: image ${r.imageRef} is current"
             rm -rf "$TMPDIR"
@@ -91,63 +255,211 @@ let
     )}
   '';
 
+  mkContainerArgs =
+    name: c:
+    let
+      allLabels = c.labels // {
+        "managed-by" = "nix-apple-container";
+      };
+    in
+    [
+      bin
+      "run"
+      "--name"
+      name
+    ]
+    ++ lib.optionals (c.entrypoint != null) [
+      "--entrypoint"
+      c.entrypoint
+    ]
+    ++ lib.optionals (c.user != null) [
+      "--user"
+      c.user
+    ]
+    ++ lib.optionals (c.workdir != null) [
+      "--workdir"
+      c.workdir
+    ]
+    ++ lib.optional c.init "--init"
+    ++ lib.optional c.ssh "--ssh"
+    ++ lib.optional c.readOnly "--read-only"
+    ++ lib.optionals (c.network != null) [
+      "--network"
+      c.network
+    ]
+    ++ (lib.concatMap (e: [
+      "--env"
+      e
+    ]) (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
+    ++ (lib.concatMap (l: [
+      "--label"
+      l
+    ]) (lib.mapAttrsToList (k: v: "${k}=${v}") allLabels))
+    ++ (lib.concatMap (v: [
+      "--volume"
+      v
+    ]) c.volumes)
+    ++ c.extraArgs
+    ++ [ c.image ]
+    ++ c.cmd;
+
   mkContainerRunScript =
     name: c:
     let
       nixImagePath = nixImagePaths.${c.image} or null;
-      allLabels = c.labels // {
-        "managed-by" = "nix-apple-container";
-      };
-      args = [
-        bin
-        "run"
-        "--name"
-        name
-      ]
-      ++ lib.optionals (c.entrypoint != null) [
-        "--entrypoint"
-        c.entrypoint
-      ]
-      ++ lib.optionals (c.user != null) [
-        "--user"
-        c.user
-      ]
-      ++ lib.optionals (c.workdir != null) [
-        "--workdir"
-        c.workdir
-      ]
-      ++ lib.optional c.init "--init"
-      ++ lib.optional c.ssh "--ssh"
-      ++ lib.optional c.readOnly "--read-only"
-      ++ lib.optionals (c.network != null) [
-        "--network"
-        c.network
-      ]
-      ++ (lib.concatMap (e: [
-        "--env"
-        e
-      ]) (lib.mapAttrsToList (k: v: "${k}=${v}") c.env))
-      ++ (lib.concatMap (l: [
-        "--label"
-        l
-      ]) (lib.mapAttrsToList (k: v: "${k}=${v}") allLabels))
-      ++ (lib.concatMap (v: [
-        "--volume"
-        v
-      ]) c.volumes)
-      ++ c.extraArgs
-      ++ [ c.image ]
-      ++ c.cmd;
+      args = mkContainerArgs name c;
     in
     pkgs.writeShellScript "container-run-${name}" ''
+      ${mkShellLogging "container-${name}"}
+
       if [ "$(id -un)" != "${cfg.user}" ]; then
+        nac_log "launchd invoked as $(id -un); expected ${cfg.user}; exiting without action"
         exit 0
       fi
+
+      wait_for_runtime() {
+        local attempt=1
+        nac_log "waiting for runtime readiness"
+        while [ "$attempt" -le 30 ]; do
+          if ${bin} system status >/dev/null 2>&1; then
+            sleep 1
+            if ${bin} system status >/dev/null 2>&1; then
+              nac_log "runtime became ready after $attempt probe(s)"
+              return 0
+            fi
+          fi
+          if [ "$attempt" -eq 1 ] || [ $((attempt % 5)) -eq 0 ] || [ "$attempt" -eq 30 ]; then
+            nac_log "runtime not ready yet (probe $attempt/30)"
+          fi
+          sleep 1
+          attempt=$((attempt + 1))
+        done
+        nac_log "runtime did not become ready after 30 probes; skipping start for ${name}"
+        return 1
+      }
+
       ${lib.optionalString (nixImagePath != null) "# nix-image: ${nixImagePath}"}
-      ${bin} stop ${lib.escapeShellArg name} 2>/dev/null || true
-      ${bin} rm ${lib.escapeShellArg name} 2>/dev/null || true
-      exec ${lib.escapeShellArgs args}
+      startup_attempt=1
+      max_startup_attempts=5
+
+      while true; do
+        wait_for_runtime || exit 0
+
+        nac_log "startup attempt ''${startup_attempt}/''${max_startup_attempts}: reconciling existing container state"
+        ${bin} stop ${lib.escapeShellArg name} 2>/dev/null || true
+        ${bin} rm ${lib.escapeShellArg name} 2>/dev/null || true
+
+        nac_log "running container ${name} from image ${c.image}"
+        SECONDS=0
+        set +e
+        ${lib.escapeShellArgs args} &
+        run_pid=$!
+        nac_log "container run child pid=''${run_pid}"
+        wait "$run_pid"
+        status=$?
+        set -e
+        run_duration=$SECONDS
+
+        if [ "$status" -eq 0 ]; then
+          nac_log "container ${name} started successfully in ''${run_duration}s"
+          exit 0
+        fi
+
+        nac_log "container ${name} exited with status ''${status} after ''${run_duration}s"
+        if [ "$startup_attempt" -ge "$max_startup_attempts" ] || [ "$run_duration" -ge 10 ]; then
+          nac_log "giving up after attempt ''${startup_attempt}; propagating status ''${status}"
+          exit "$status"
+        fi
+
+        nac_log "${name} hit a transient runtime error during startup; retrying (''${startup_attempt}/''${max_startup_attempts})"
+        nac_log "reissuing 'container system start --disable-kernel-install' before retry"
+        ${bin} system start --disable-kernel-install >/dev/null 2>&1 || true
+        sleep 2
+        startup_attempt=$((startup_attempt + 1))
+      done
     '';
+
+  mkLaunchdPlist =
+    label: serviceConfig:
+    pkgs.writeText "${label}.plist" (lib.generators.toPlist { escape = true; } serviceConfig);
+
+  mkManagedLaunchAgentPlist =
+    {
+      label,
+      programArguments,
+      logStem,
+      runAtLoad,
+      keepAlive ? null,
+      extraConfig ? { },
+    }:
+    mkLaunchdPlist label (
+      {
+        Label = label;
+        ProgramArguments = programArguments;
+        LimitLoadToSessionType = [ "Background" ];
+        RunAtLoad = runAtLoad;
+        StandardOutPath = "${userHome}/Library/Logs/${logStem}.log";
+        StandardErrorPath = "${userHome}/Library/Logs/${logStem}.err";
+      }
+      // lib.optionalAttrs (keepAlive != null) {
+        KeepAlive = keepAlive;
+      }
+      // extraConfig
+    );
+
+  runtimePlist = mkManagedLaunchAgentPlist {
+    label = runtimeLabel;
+    programArguments = [ (toString bootstrapManagedContainersScript) ];
+    logStem = "container-runtime";
+    runAtLoad = true;
+    keepAlive = {
+      SuccessfulExit = false;
+    };
+    extraConfig = {
+      EnvironmentVariables.${logContextVar} = runtimeLabel;
+    };
+  };
+
+  containerPlists = lib.mapAttrs' (
+    name: c:
+    let
+      label = "dev.apple.container.${name}";
+    in
+    lib.nameValuePair label {
+      inherit label;
+      plist = mkManagedLaunchAgentPlist {
+        inherit label;
+        programArguments = [ (toString (mkContainerRunScript name c)) ];
+        logStem = "container-${name}";
+        runAtLoad = false;
+        keepAlive = {
+          OtherJobEnabled = {
+            "com.apple.container.apiserver" = true;
+          };
+        };
+      };
+      targetPath = "${managedAgentDir}/${label}.plist";
+    }
+  ) autoStartContainers;
+
+  syncLaunchdFilesScript = pkgs.writeShellScript "sync-container-launchd-files" ''
+    for cmd in install rm; do
+      command -v "$cmd" >/dev/null 2>&1 || {
+        echo "nix-apple-container: '$cmd' is required but not found in PATH" >&2
+        exit 1
+      }
+    done
+
+    install -d -m 755 -o root -g wheel "${managedAgentDir}"
+    install -o root -g wheel -m 644 "${runtimePlist}" "${runtimeAgentPath}"
+    rm -f "${managedAgentDir}"/dev.apple.container.*.plist
+    rm -rf "${appSupport}/launchd"
+    ${lib.concatStrings (
+      lib.mapAttrsToList (_: spec: ''
+        install -o root -g wheel -m 644 "${spec.plist}" "${spec.targetPath}"
+      '') containerPlists
+    )}
+  '';
 
 in
 {
@@ -190,8 +502,17 @@ in
         }
         pkgutil --pkg-info com.apple.container-installer &>/dev/null && \
           sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
+        CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
+        if [ -n "$CONTAINER_UID" ]; then
+          launchctl bootout "gui/$CONTAINER_UID/${runtimeLabel}" 2>/dev/null || true
+          launchctl bootout "user/$CONTAINER_UID/${runtimeLabel}" 2>/dev/null || true
+          ${bootoutManagedLabelsScript ""}
+        fi
+        rm -f "${runtimeAgentPath}"
+        rm -f "${managedAgentDir}"/dev.apple.container.*.plist
+        rm -rf "${appSupport}/launchd"
         rm -f "${userBuilderKey}" "${userBuilderPubKey}"
-        rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
+        rm -f "${systemBuilderKey}" "${systemBuilderPubKey}"
       '';
     })
 
@@ -199,16 +520,22 @@ in
     (lib.mkIf cfg.enable {
       assertions =
         let
-          bad = lib.filterAttrs (_: c: builtins.any (v: !(lib.hasInfix ":" v)) c.volumes) cfg.containers;
+          badVolumes = lib.filterAttrs (
+            _: c: builtins.any (v: !(lib.hasInfix ":" v)) c.volumes
+          ) cfg.containers;
         in
-        lib.optional (bad != { }) {
+        lib.optional (badVolumes != { }) {
           assertion = false;
-          message = "nix-apple-container: containers ${lib.concatStringsSep ", " (lib.attrNames bad)} have volumes without a ':'. Use host:container for bind mounts or name:container for named volumes.";
+          message = "nix-apple-container: containers ${lib.concatStringsSep ", " (lib.attrNames badVolumes)} have volumes without a ':'. Use host:container for bind mounts or name:container for named volumes.";
+        }
+        ++ lib.optional (cfg.user != config.system.primaryUser) {
+          assertion = false;
+          message = "nix-apple-container: services.containerization.user must match system.primaryUser (${config.system.primaryUser}) because the login-time runtime agent is installed only for the primary user.";
         };
 
       environment.systemPackages = [ cfg.package ];
 
-      environment.etc."resolver/containerization.test" = {
+      environment.etc."${resolverRelativePath}" = {
         text = ''
           domain test
           search test
@@ -223,46 +550,9 @@ in
         };
       };
 
-      launchd.daemons.container-runtime = {
-        serviceConfig = {
-          Label = runtimeLabel;
-          ProgramArguments = [
-            (toString (
-              pkgs.writeShellScript "container-runtime-start" ''
-                exec ${runAs} ${bin} system start --disable-kernel-install
-              ''
-            ))
-          ];
-          RunAtLoad = true;
-          KeepAlive = {
-            SuccessfulExit = false;
-          };
-          StandardOutPath = "${userHome}/Library/Logs/container-runtime.log";
-          StandardErrorPath = "${userHome}/Library/Logs/container-runtime.err";
-        };
-      };
-
-      launchd.user.agents = lib.mapAttrs' (
-        name: c:
-        lib.nameValuePair "container-${name}" {
-          serviceConfig = {
-            Label = "dev.apple.container.${name}";
-            ProgramArguments = [ (toString (mkContainerRunScript name c)) ];
-            LimitLoadToSessionType = [ "Background" ];
-            RunAtLoad = false;
-            KeepAlive = {
-              OtherJobEnabled = {
-                "com.apple.container.apiserver" = true;
-              };
-            };
-            StandardOutPath = "${userHome}/Library/Logs/container-${name}.log";
-            StandardErrorPath = "${userHome}/Library/Logs/container-${name}.err";
-          };
-        }
-      ) autoStartContainers;
-
-      # preActivation runs before launchd loads agents — images must be
-      # loaded before containers try to start
+      # preActivation runs before later activation hooks. Ensure the runtime is
+      # available so images can be loaded before the postActivation bootstrap
+      # recreates the managed container jobs.
       system.activationScripts.preActivation.text = lib.mkAfter (
         lib.concatStrings [
           ''
@@ -272,16 +562,20 @@ in
             # can re-register with the current binary.
             CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
             if [ -n "$CONTAINER_UID" ]; then
-              APISERVER_BIN=$(launchctl asuser "$CONTAINER_UID" sudo --user="${cfg.user}" -- \
-                launchctl print "user/$CONTAINER_UID/com.apple.container.apiserver" 2>/dev/null \
-                | grep "path = " | awk '{print $3}') || true
-              if [ -n "$APISERVER_BIN" ] && [ ! -x "$APISERVER_BIN" ]; then
-                echo "nix-apple-container: deregistering stale apiserver ($APISERVER_BIN)..."
-                launchctl asuser "$CONTAINER_UID" sudo --user="${cfg.user}" -- \
-                  launchctl bootout "user/$CONTAINER_UID/com.apple.container.apiserver" 2>/dev/null || true
-              fi
+              ${userDomainLoop "$CONTAINER_UID" ''
+                APISERVER_BIN=$(launchctl asuser "$CONTAINER_UID" sudo --user="${cfg.user}" -- \
+                  launchctl print "$domain/com.apple.container.apiserver" 2>/dev/null \
+                  | grep "path = " | awk '{print $3}') || true
+                if [ -n "$APISERVER_BIN" ] && [ ! -x "$APISERVER_BIN" ]; then
+                  echo "nix-apple-container: deregistering stale apiserver from $domain ($APISERVER_BIN)..."
+                  launchctl asuser "$CONTAINER_UID" sudo --user="${cfg.user}" -- \
+                    launchctl bootout "$domain/com.apple.container.apiserver" 2>/dev/null || true
+                fi
+              ''}
             fi
 
+            echo "nix-apple-container: syncing launchd assets..."
+            ${syncLaunchdFilesScript}
             if ! ${runAs} ${bin} system status &>/dev/null; then
               echo "nix-apple-container: starting runtime..."
               ${runAs} ${bin} system start --disable-kernel-install
@@ -311,7 +605,7 @@ in
 
         # Now stop and remove containers not declared in config
         DECLARED="${lib.concatStringsSep " " (lib.attrNames cfg.containers)}"
-        for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${pkgs.jq}/bin/jq -r '.[].configuration.id // empty' 2>/dev/null); do
+        for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${jq} -r '.[].configuration.id // empty' 2>/dev/null); do
           KEEP=false
           for d in $DECLARED; do
             if [ "$cid" = "$d" ]; then KEEP=true; break; fi
@@ -322,6 +616,9 @@ in
             ${runAs} ${bin} rm "$cid" 2>/dev/null || true
           fi
         done
+
+        echo "nix-apple-container: bootstrapping launchd-managed containers..."
+        ${bootstrapManagedContainersScript}
       '';
     })
 

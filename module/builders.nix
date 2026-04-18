@@ -7,24 +7,24 @@
 }:
 
 let
+  common = import ./common.nix { inherit config; };
   cfg = config.services.containerization;
   builderCfg = cfg."linux-builder";
   anyBuilderEnabled = builderCfg.aarch64.enable || builderCfg.x86_64.enable;
+  inherit (common)
+    systemBuilderKey
+    systemBuilderPubKey
+    userBuilderKey
+    userBuilderPubKey
+    userHome
+    ;
 
   # https://github.com/apple/container/issues/1142
   rosettaCompatKernel = pkgs.callPackage ../pkgs/kernel.nix {
     version = "3.24.0";
     hash = "sha256-1WvjYfBMNeHXWv//S3L5LCeAhcffGvp5QGuEfRwQffU=";
   };
-
-  userHome =
-    if config.users.users ? ${cfg.user} then
-      config.users.users.${cfg.user}.home
-    else
-      "/Users/${cfg.user}";
-
-  userBuilderKey = "${userHome}/.ssh/nix-builder_ed25519";
-  userBuilderPubKey = "${userHome}/.ssh/nix-builder_ed25519.pub";
+  userSshDir = "${userHome}/.ssh";
 
   # Builder architecture definitions — only platform and defaults differ
   builderArches = {
@@ -95,6 +95,23 @@ let
     };
 
   # Generate per-arch config blocks (container, SSH, buildMachines)
+  mkBuildMachine =
+    {
+      archCfg,
+      hostName,
+      nixSystems,
+    }:
+    {
+      inherit hostName;
+      protocol = "ssh-ng";
+      sshUser = "root";
+      sshKey = userBuilderKey;
+      systems = nixSystems;
+      maxJobs = archCfg.maxJobs;
+      speedFactor = archCfg.speedFactor;
+      supportedFeatures = [ "big-parallel" ];
+    };
+
   mkBuilderArchConfig =
     arch:
     {
@@ -151,16 +168,10 @@ let
       # Declarative Nix config (plain nix-darwin)
       (lib.mkIf (cfg.enable && archCfg.enable && config.nix.enable) {
         nix.buildMachines = [
-          {
+          (mkBuildMachine {
+            inherit archCfg nixSystems;
             hostName = name;
-            protocol = "ssh-ng";
-            sshUser = "root";
-            sshKey = userBuilderKey;
-            systems = nixSystems;
-            maxJobs = archCfg.maxJobs;
-            speedFactor = archCfg.speedFactor;
-            supportedFeatures = [ "big-parallel" ];
-          }
+          })
         ];
         nix.distributedBuilds = lib.mkDefault true;
         nix.settings.builders-use-substitutes = lib.mkDefault true;
@@ -182,11 +193,11 @@ in
       # Linux builder cleanup (module enabled but no builders active)
       (lib.mkIf (cfg.enable && !anyBuilderEnabled) {
         system.activationScripts.postActivation.text = lib.mkAfter ''
-          if [ -f "${userBuilderKey}" ] || [ -f /etc/nix/builder_ed25519 ]; then
+          if [ -f "${userBuilderKey}" ] || [ -f "${systemBuilderKey}" ]; then
             echo "nix-apple-container: removing linux builder resources..."
           fi
           rm -f "${userBuilderKey}" "${userBuilderPubKey}"
-          rm -f /etc/nix/builder_ed25519 /etc/nix/builder_ed25519.pub
+          rm -f "${systemBuilderKey}" "${systemBuilderPubKey}"
         '';
       })
 
@@ -196,7 +207,7 @@ in
         # Root can still read it for daemon-driven builds, so no duplicate
         # /etc/nix copy is needed.
         system.activationScripts.preActivation.text = lib.mkAfter ''
-          install -d -m 700 -o ${cfg.user} "${userHome}/.ssh"
+          install -d -m 700 -o ${cfg.user} "${userSshDir}"
           if ! cmp -s ${../builder/builder_ed25519} "${userBuilderKey}" 2>/dev/null; then
             install -o ${cfg.user} -m 600 ${../builder/builder_ed25519} "${userBuilderKey}"
             install -o ${cfg.user} -m 644 ${../builder/builder_ed25519.pub} "${userBuilderPubKey}"
@@ -226,16 +237,10 @@ in
                   let
                     archCfg = builderCfg.${arch};
                   in
-                  lib.optional archCfg.enable {
+                  lib.optional archCfg.enable (mkBuildMachine {
+                    inherit archCfg nixSystems;
                     hostName = "nix-builder-${nameSuffix}";
-                    protocol = "ssh-ng";
-                    sshUser = "root";
-                    sshKey = userBuilderKey;
-                    systems = nixSystems;
-                    maxJobs = archCfg.maxJobs;
-                    speedFactor = archCfg.speedFactor;
-                    supportedFeatures = [ "big-parallel" ];
-                  }
+                  })
                 ) builderArches
               );
               distributedBuilds = true;
