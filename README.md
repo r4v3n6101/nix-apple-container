@@ -17,11 +17,11 @@ A nix-darwin module for declaratively managing [Apple Containerization][apple-co
 - Packages the `container` CLI from Apple's `.pkg` release via Nix
 - Manages the Kata Linux kernel as a Nix derivation (no runtime download from GitHub)
 - Starts the container runtime and installs the kernel automatically
-- Declares containers that run as launchd user agents (automatically recreated on config change)
+- Installs Background-session LaunchAgent plists in `/Library/LaunchAgents` and bootstraps managed container jobs after the runtime is up
 - Containers are addressable by name from the host and from other containers (e.g. `foo.test` for a container named `foo`)
 - Auto-creates host directories for volume mounts
 - Optional Linux builder containers for building `aarch64-linux` and `x86_64-linux` derivations on macOS
-- Reconciles running containers against config — removes undeclared containers and their launchd agents
+- Reconciles running containers against config — removes undeclared containers and their launchd jobs
 - Builds and loads Nix-built OCI images via [nix2container][nix2container] — no tarballs in the Nix store
 
 > **Runtime ownership**: This module fully owns the configured user's Apple container runtime. Undeclared containers are treated as drift and removed on rebuild. nix2container images are loaded via `container image load` at activation time; registry images are pulled by the runtime automatically when a container starts. Disabling the module tears down the runtime wholesale.
@@ -58,7 +58,7 @@ Add the flake input:
     # Follow master — picks up nix-builder image updates automatically:
     nix-apple-container.url = "github:halfwhey/nix-apple-container";
     # Pin to a release for stability:
-    # nix-apple-container.url = "github:halfwhey/nix-apple-container/v0.0.5";
+    # nix-apple-container.url = "github:halfwhey/nix-apple-container/v0.0.6";
 
     nix-apple-container.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -83,7 +83,9 @@ Import the module in your darwin host config:
 }
 ```
 
-After `darwin-rebuild switch`, the container runtime starts, the image is pulled from the registry, and the container runs as a launchd user agent. Changing any container option (image, env, volumes, ports) and rebuilding will automatically stop the old container and start a fresh one with the new config.
+After `darwin-rebuild switch`, activation syncs Background-session plists into `/Library/LaunchAgents`. The runtime agent starts Apple `container` in the primary user's launchd domain and then explicitly bootstraps the managed container jobs with `launchctl bootstrap user/<uid> ...` after `container system start` succeeds. Those container jobs are registered as passive plists and only start once `com.apple.container.apiserver` is enabled, which avoids launch-time races during activation. Changing any container option (image, env, volumes, ports) and rebuilding will automatically stop the old container and start a fresh one with the new config.
+
+This follows upstream Apple `container` semantics: the runtime is available after the first session for `system.primaryUser` exists. A GUI login works, and an SSH login as that user works too. `services.containerization.user` must match `system.primaryUser`.
 
 ## Options
 
@@ -157,6 +159,10 @@ the per-builder kernel used by `linux-builder.<arch>.kernel`. By default,
 The builder image tag is versioned independently from the base `nixos/nix`
 version. Tags use the form `<builder-version>-nix<nix-version>`, for example
 `v2-nix2.34.6`.
+
+Formatting is managed with [treefmt-nix][treefmt-nix]. Run `nix fmt` (or
+`make fmt`) to format the repo, and `nix flake check` to verify formatting in
+CI. The current config enables `nixfmt` for `.nix` files.
 
 For a fully custom kernel (different source or extraction logic), pass any flat-file derivation to `kernel`:
 
@@ -273,7 +279,7 @@ services.containerization = {
 
 Set `enable = false` and rebuild. The module will:
 
-1. Unload all container launchd agents
+1. Unload all container launchd user agents
 2. Stop the container runtime
 3. Remove runtime state (`~/Library/Application Support/com.apple.container/`) — respects `preserveImagesOnDisable` and `preserveVolumesOnDisable`
 4. Remove builder SSH key (`~/.ssh/nix-builder_ed25519*`) and legacy `/etc/nix/builder_ed25519*` if present
@@ -305,6 +311,10 @@ To check for active tunnel interfaces:
 ifconfig | grep utun
 ```
 
+### Headless Mac: first user session still required
+
+The module keeps the runtime in the user's launchd domain because Apple `container` expects its apiserver there, not in `system`. After a cold boot, containers will not start until `system.primaryUser` has an active session. A GUI login works, and an SSH login as that user also works; the Background-session runtime agent then bootstraps the managed container jobs into that session's user launchd domain.
+
 ### Headless Mac: permission popups block container startup
 
 On headless Mac minis (or any Mac without a display), macOS may present GUI permission dialogs for network or volume access the first time a container starts. These popups are invisible over SSH and will silently block the container from launching.
@@ -314,5 +324,6 @@ Connect a display (or use screen sharing) and approve the permission prompts. On
 [apple-containerization]: https://github.com/apple/containerization
 [nix-darwin]: https://github.com/LnL7/nix-darwin
 [nix2container]: https://github.com/nlewo/nix2container
+[treefmt-nix]: https://github.com/numtide/treefmt-nix
 [options]: docs/options.md
 [vpn-issue]: https://github.com/apple/container/issues/1307
