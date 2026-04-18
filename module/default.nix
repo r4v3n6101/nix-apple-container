@@ -103,6 +103,11 @@ let
   '';
 
   autoStartContainers = lib.filterAttrs (_: c: c.autoStart) cfg.containers;
+  registryAutoStartImages = lib.unique (
+    lib.filter (image: !(builtins.hasAttr image nixImagePaths)) (
+      lib.mapAttrsToList (_: c: c.image) autoStartContainers
+    )
+  );
   bootstrapManagedContainersScript = pkgs.writeShellScript "bootstrap-managed-containers" ''
     ${mkShellLogging "bootstrap-managed-containers"}
 
@@ -187,6 +192,10 @@ let
       [ -f "$plist" ] || continue
       found_managed_plist=1
       label="$(basename "$plist" .plist)"
+      if launchctl print "$CONTAINER_DOMAIN/$label" >/dev/null 2>&1; then
+        nac_log "booting out existing managed label '$label' from '$CONTAINER_DOMAIN' before bootstrap"
+        launchctl bootout "$CONTAINER_DOMAIN/$label" 2>/dev/null || true
+      fi
       nac_log "bootstrapping '$label' from '$plist' into '$CONTAINER_DOMAIN'"
       launchctl enable "$CONTAINER_DOMAIN/$label" >/dev/null 2>&1 || true
       launchctl bootstrap "$CONTAINER_DOMAIN" "$plist"
@@ -253,6 +262,30 @@ let
         ''
       ) cfg.images
     )}
+  '';
+
+  registryImagePullScript = lib.optionalString (registryAutoStartImages != [ ]) ''
+    ${lib.concatMapStrings (image: ''
+      if ${runAs} ${bin} image inspect ${lib.escapeShellArg image} >/dev/null 2>&1; then
+        echo "nix-apple-container: image ${image} is present"
+      else
+        attempt=1
+        max_attempts=3
+        while true; do
+          echo "nix-apple-container: pulling registry image ${image} (attempt $attempt/$max_attempts)..."
+          if ${runAs} ${bin} image pull ${lib.escapeShellArg image}; then
+            break
+          fi
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "nix-apple-container: failed to pull registry image ${image} after $max_attempts attempts" >&2
+            exit 1
+          fi
+          echo "nix-apple-container: pull for ${image} failed; retrying in 5s..." >&2
+          attempt=$((attempt + 1))
+          sleep 5
+        done
+      fi
+    '') registryAutoStartImages}
   '';
 
   mkContainerArgs =
@@ -494,12 +527,7 @@ in
         fi
 
         # These run regardless of APP_SUPPORT existence
-        ${
-          if cfg.user == config.system.primaryUser then
-            "${runAs} defaults delete com.apple.container.defaults dns.domain 2>/dev/null || true"
-          else
-            "${runAs} ${bin} system property clear dns.domain 2>/dev/null || true"
-        }
+        ${runAs} defaults delete com.apple.container.defaults dns.domain 2>/dev/null || true
         pkgutil --pkg-info com.apple.container-installer &>/dev/null && \
           sudo pkgutil --forget com.apple.container-installer 2>/dev/null || true
         CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
@@ -507,6 +535,14 @@ in
           launchctl bootout "gui/$CONTAINER_UID/${runtimeLabel}" 2>/dev/null || true
           launchctl bootout "user/$CONTAINER_UID/${runtimeLabel}" 2>/dev/null || true
           ${bootoutManagedLabelsScript ""}
+          for domain in "gui/$CONTAINER_UID" "user/$CONTAINER_UID"; do
+            launchctl print-disabled "$domain" 2>/dev/null \
+              | awk -F'"' '/dev\.apple\.container\.|nix-apple-container\.runtime/ {print $2}' \
+              | while IFS= read -r label; do
+                  [ -n "$label" ] || continue
+                  launchctl enable "$domain/$label" >/dev/null 2>&1 || true
+                done
+          done
         fi
         rm -f "${runtimeAgentPath}"
         rm -f "${managedAgentDir}"/dev.apple.container.*.plist
@@ -580,12 +616,6 @@ in
               echo "nix-apple-container: starting runtime..."
               ${runAs} ${bin} system start --disable-kernel-install
             fi
-            ${lib.optionalString (cfg.user != config.system.primaryUser) ''
-              if [ "$(${runAs} ${bin} system property get dns.domain 2>/dev/null || true)" != "test" ]; then
-                echo "nix-apple-container: setting default DNS domain to test..."
-                ${runAs} ${bin} system property set dns.domain test
-              fi
-            ''}
             KERNEL_DIR="${appSupport}/kernels"
             ${runAs} mkdir -p "$KERNEL_DIR"
             ${runAs} ln -sf "${cfg.kernel}" "$KERNEL_DIR/default.kernel-arm64"
@@ -596,22 +626,31 @@ in
             echo "nix-apple-container: pruning stopped containers..."
             ${runAs} ${bin} prune || true
           ''
+          registryImagePullScript
         ]
       );
 
       # Reconcile containers: stop+rm undeclared containers.
       system.activationScripts.postActivation.text = lib.mkAfter ''
         echo "nix-apple-container: reconciling containers..."
+        CONTAINER_UID=$(id -u "${cfg.user}" 2>/dev/null || echo "")
 
         # Now stop and remove containers not declared in config
         DECLARED="${lib.concatStringsSep " " (lib.attrNames cfg.containers)}"
-        for cid in $(${runAs} ${bin} ls --all --format json 2>/dev/null | ${jq} -r '.[].configuration.id // empty' 2>/dev/null); do
+        for cid in $(${runAs} ${bin} ls --all --quiet 2>/dev/null); do
           KEEP=false
           for d in $DECLARED; do
             if [ "$cid" = "$d" ]; then KEEP=true; break; fi
           done
           if [ "$KEEP" = "false" ]; then
             echo "nix-apple-container: stopping undeclared container $cid..."
+            if [ -n "$CONTAINER_UID" ]; then
+              launchctl bootout "gui/$CONTAINER_UID/dev.apple.container.$cid" 2>/dev/null || true
+              launchctl bootout "user/$CONTAINER_UID/dev.apple.container.$cid" 2>/dev/null || true
+              launchctl enable "gui/$CONTAINER_UID/dev.apple.container.$cid" >/dev/null 2>&1 || true
+              launchctl enable "user/$CONTAINER_UID/dev.apple.container.$cid" >/dev/null 2>&1 || true
+            fi
+            rm -f "${managedAgentDir}/dev.apple.container.$cid.plist"
             ${runAs} ${bin} stop "$cid" 2>/dev/null || true
             ${runAs} ${bin} rm "$cid" 2>/dev/null || true
           fi

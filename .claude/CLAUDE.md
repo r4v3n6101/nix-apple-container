@@ -18,7 +18,9 @@ This is a nix-darwin module that wraps Apple's [Containerization](https://github
 
 - `module/default.nix` — nix-darwin module entrypoint; runtime/container lifecycle
 - `module/options.nix` — core module options and the container submodule definition
-- `module/builders.nix` — linux-builder options, compatibility shims, and builder config
+- `module/common.nix` — internal shared handles used by more than one module file (paths, labels, key paths)
+- `module/builders.nix` — linux-builder options and builder config
+- `module/compat.nix` — migration/compatibility layer: deprecated option renames, all legacy launchd cleanup, resolver migration allowances
 - `pkgs/package.nix` — derivation that extracts the `container` CLI from Apple's signed `.pkg`; accepts overridable `version` and `hash` args
 - `pkgs/kernel.nix` — fixed-output derivation that fetches the kata-containers kernel tarball via `curl` and extracts the binary; accepts overridable `version` and `hash` args
 - `builder/Dockerfile` — nix-builder image (`FROM nixos/nix:<version>`)
@@ -50,9 +52,9 @@ The `.pkg` does NOT extract to `usr/local/` — files are at the root of the pay
 nix-darwin activation order: `preActivation` → `launchd` → `userLaunchd` → `postActivation`.
 
 The module uses:
-- `preActivation`: runtime start, kernel install, image loading (nix2container), mount dir creation, container pruning
-- Main activation (nix-darwin): loads/unloads launchd agents (starts/stops containers)
-- `postActivation`: reconcile stale agents, stop undeclared containers, builder SSH setup
+- `preActivation`: sync launchd plist assets, runtime start, kernel install, image loading (nix2container), registry image pre-pull for auto-start containers, mount dir creation, container pruning
+- Main activation (nix-darwin): no module-owned launchd jobs are loaded here; user-domain jobs are managed explicitly
+- `postActivation`: stop undeclared containers, bootstrap current managed container jobs, builder SSH setup
 
 ### Activation (enable = true)
 
@@ -64,30 +66,31 @@ The module uses:
 5. Prunes stopped containers (`container prune`)
 
 `postActivation`:
-1. Unloads stale launchd agents (`dev.apple.container.*.plist`) not in current config
-2. Stops and removes containers not declared in config
+1. Stops and removes containers not declared in config
 
 ### Containers (autoStart = true)
 
-Declared as `launchd.user.agents` (NOT `launchd.daemons`). This is critical because:
-- The container runtime stores state per-user under `~/Library/Application Support/`
-- `launchd.daemons` run as root, which puts state under `/var/root/` — wrong user context
-- `launchd.user.agents` run as the logged-in user
+The runtime itself is a Background-session LaunchAgent plist (`/Library/LaunchAgents/nix-apple-container.runtime.plist`) for `system.primaryUser`. This keeps Apple `container` in the user's launchd domain, which is what upstream expects for the apiserver/XPC path. It does mean the runtime only comes up after the first session for that user exists (GUI login or SSH/background session).
+
+Auto-start containers are separate plists stored in `/Library/LaunchAgents/`. The module bootstraps those plists into `user/<uid>` explicitly after `container system start` succeeds, instead of relying on nix-darwin's `userLaunchd` `load -w` path. Before each bootstrap, activation explicitly `bootout`s the target label in the resolved domain if it is already loaded, so re-bootstrap works even when the container is already running. The plists themselves stay passive (`RunAtLoad = false`) and use `KeepAlive.OtherJobEnabled."com.apple.container.apiserver" = true`, so launchd only starts them once the runtime has registered the apiserver.
 
 Each container's `ProgramArguments` points to a wrapper script (`mkContainerRunScript`) that:
 1. Stops and removes any existing container with the same name
-2. `exec container run ...` with all configured flags
+2. Waits for a stable runtime/apiserver and retries a few quick boot-time XPC failures
+3. Runs `container run ...` with all configured flags
 
-This wrapper ensures config changes are applied cleanly — when the plist changes, nix-darwin reloads the agent, the new wrapper cleans up the old container VM, and starts fresh. The `--detach` flag is NOT used because launchd manages the process lifecycle.
+This wrapper ensures config changes are applied cleanly — when the plist changes, activation rewrites the managed plist set and the runtime bootstrap recreates the job, so the new wrapper cleans up the old container VM and starts fresh. It also smooths over the transient XPC interruptions that can happen right after reboot while Apple `container` is still settling. The `--detach` flag is NOT used because launchd manages the process lifecycle.
 
-For containers referencing Nix-managed images (in `images.*`), the wrapper script embeds the image's `copyTo` store path as a comment. When image content changes, the store path changes, the script content changes, the plist changes, and nix-darwin restarts the agent — ensuring the container picks up the new image. Registry images are unaffected.
+The runtime/bootstrap script and each container wrapper now wrap their stdout/stderr with ISO-8601 timestamps plus a context tag (`[nix-apple-container.runtime]`, `[container-<name>]`, `[bootstrap-managed-containers]`). That means `~/Library/Logs/container-runtime.{log,err}` and `~/Library/Logs/container-<name>.{log,err}` are timeline logs, not raw command output. The wrappers also log the child `container run` PID plus final exit/signal status. Use those files first when debugging launchd behavior.
+
+For containers referencing Nix-managed images (in `images.*`), the wrapper script embeds the image's `copyTo` store path as a comment. When image content changes, the store path changes, the script content changes, the plist changes, and nix-darwin reloads the user agent — ensuring the container picks up the new image. Registry images are unaffected.
 
 ### Teardown (enable = false)
 
-Agent unloading, defaults cleanup, and builder key removal run unconditionally. Runtime state cleanup is guarded by `if [ -d "$APP_SUPPORT" ]` to prevent noisy no-ops on first import with `enable = false`.
+Compatibility cleanup for legacy launch agents, defaults cleanup, and builder key removal run unconditionally. Runtime state cleanup is guarded by `if [ -d "$APP_SUPPORT" ]` to prevent noisy no-ops on first import with `enable = false`.
 
 When disabled:
-1. Unloads all module-owned launchd agents (`dev.apple.container.*.plist`) — runs unconditionally, before system stop to prevent KeepAlive restart loops
+1. Removes legacy user/system launch agents and stale system launch daemons during compatibility cleanup
 2. `container system stop` — deregisters launchd services, stops containers (guarded by APP_SUPPORT)
 3. Always removes `kernels/` and `content/ingest/` (safe to recreate)
 4. If `preserveImagesOnDisable = false` (default): removes `content/` (image blobs + metadata)
@@ -104,7 +107,7 @@ Container names always include a URI-safe platform suffix: `nix-builder-aarch64`
 
 The builder image must persist both `sandbox = false` and `filter-syscalls = false` in `/etc/nix/nix.conf`. Setting `filter-syscalls = false` only on one-off image build commands is not enough — remote builds can still fail during environment setup with `unable to load seccomp BPF program: Invalid argument`, especially on the amd64/Rosetta path.
 
-The old `linuxBuilder.*` option names are deprecated but still work via `mkRenamedOptionModule` (7 entries in `module/builders.nix`). They map to `linux-builder.aarch64.*` (per-arch options) and `linux-builder.image` (shared).
+The old `linuxBuilder.*` option names are deprecated but still work via `mkRenamedOptionModule` (7 entries in `module/compat.nix`). They map to `linux-builder.aarch64.*` (per-arch options) and `linux-builder.image` (shared).
 
 The default image tag in `module/builders.nix` (`services.containerization.linux-builder.image`) uses `<builder-version>-nix<nix-version>` (e.g. `v2-nix2.34.6`), not `:latest`. `builder/IMAGE_VERSION` is bumped manually when the builder image semantics change; the nix-version suffix is bumped automatically by `build-builder.yml` when the `nixos/nix` base image changes. The CI regex (`s|ghcr.io/halfwhey/nix-builder:[^"]*|...|`) matches the string literal in the option default value.
 
@@ -113,6 +116,8 @@ Users can override the image via `services.containerization.linux-builder.image 
 Implementation structure across `module/`:
 - `module/default.nix`: runtime start/teardown, image loading, launchd jobs, container reconciliation
 - `module/options.nix`: core `services.containerization` options and the container submodule
+- `module/common.nix`: shared handles only; no behavior logic
+- `module/compat.nix`: migration-only behavior: renamed option imports, all legacy user/system launchd cleanup, resolver migration handling
 - `module/builders.nix`: `builderCfg`/`anyBuilderEnabled`, per-arch builder options/config, SSH key setup, and Determinate/plain Nix builder wiring
 
 Builder config uses backend-specific declarative options when possible:
@@ -126,7 +131,7 @@ When all builders disabled: removes `/etc/nix/builder_ed25519*`. Containers remo
 
 Two image sources:
 - **`images.*`** (`attrsOf package`): nix2container `buildImage` or `pullImage`. Built at Nix eval time, loaded into the runtime via `container image load` at activation time.
-- **Registry images**: Containers referencing images not in `images.*` are pulled automatically by the container runtime when `container run` is invoked. No Nix-side fetch needed.
+- **Registry images**: For `autoStart` containers referencing images not in `images.*`, activation pre-pulls them with `container image pull` as the configured user before launchd bootstrap. This avoids first-run registry fetch failures inside launchd-managed `container run`. Non-autoStart containers still rely on the runtime to pull on demand.
 
 **Image loading**: At activation time, nix2container's `copyTo` exports the image to a temp OCI layout dir, which is tarred and loaded via `container image load -i`. The OCI dir must NOT be pre-built in the Nix store — `container image load` fails on tars created from read-only Nix store paths. The temp dir and tar are deleted after loading.
 
@@ -136,9 +141,11 @@ Two image sources:
 
 ### Root vs user context
 
-`darwin-rebuild switch` runs activation scripts as root. Container CLI calls in activation scripts use `sudo -u <user> --` (`runAs`) to run as the actual user. Launchd agent wrappers (`mkContainerRunScript`) run directly as the user since launchd.user.agents runs in the user session. The `user` option defaults to `config.system.primaryUser`.
+`darwin-rebuild switch` runs activation scripts as root. Container CLI calls in activation scripts use `sudo -u <user> --` (`runAs`) to run as the actual user. The module installs the runtime plist and managed container plists into `/Library/LaunchAgents`, then bootstraps the container jobs explicitly into the user's launchd context. The `user` option defaults to `config.system.primaryUser`, and the module asserts that they match.
 
 The user's home directory is resolved at Nix eval time via `userHome` (checks `config.users.users` first, falls back to `/Users/${cfg.user}`).
+
+For reconciliation, prefer `container ls --all --quiet` over parsing `--format json`. The quiet output is the stable container ID/name list; the JSON shape is not a good contract for activation scripts.
 
 ## Idempotency and cleanup principles
 
@@ -148,7 +155,7 @@ Every activation script and feature MUST follow these rules:
 
 - **Guard before acting**: Check state before modifying. Don't start the runtime if already running (`system status`). Don't reload images if the digest matches. Don't append to `known_hosts` if the key is already present.
 - **No unconditional appends**: Never `>> file` without checking if the content is already there. Use `grep -qF` to deduplicate.
-- **No unconditional restarts**: Don't restart daemons unless config actually changed. nix-darwin's plist diffing handles launchd agents. The Nix daemon reads `/etc/nix/machines` on demand.
+- **No unconditional restarts**: Don't restart daemons unless config actually changed. nix-darwin's plist diffing handles launchd jobs. The Nix daemon reads `/etc/nix/machines` on demand.
 - **Activation scripts run on every rebuild**: Assume they run repeatedly with no config changes. They must produce no side effects in that case.
 
 ### Cleanup (enable/disable lifecycle)
@@ -158,7 +165,7 @@ Every feature that creates state outside the Nix store MUST clean it up when dis
 | Component | State created | Cleanup when disabled |
 |-----------|--------------|----------------------|
 | Module (`enable`) | `~/Library/Application Support/com.apple.container/`, defaults, pkg receipt | Teardown block with `!cfg.enable` guard; selective cleanup based on `preserveImagesOnDisable` and `preserveVolumesOnDisable`; also removes builder files |
-| Containers (`autoStart`) | Launchd agents (`dev.apple.container.*.plist`), running container VMs | postActivation reconciliation unloads agents + stops/removes containers; teardown also unloads agents before system stop |
+| Containers (`autoStart`) | Managed plists in `/Library/LaunchAgents/`, bootstrapped `dev.apple.container.*` jobs, running container VMs | postActivation bootstraps the current plist set; teardown bootouts all managed labels and removes the managed plists |
 | Linux builders (`linux-builder.{aarch64,x86_64}.enable`) | `/etc/nix/builder_ed25519*`, `programs.ssh.extraConfig`, `nix.buildMachines` (declarative), `determinateNix.customSettings` (Determinate), containers `nix-builder-aarch64` / `nix-builder-amd64` | `!anyBuilderEnabled` block removes SSH key; containers removed by reconciliation; declarative options cleared by nix-darwin |
 | Kernel | Symlinks in `$APP_SUPPORT/kernels/` pointing to Nix store | Removed with kernels dir on teardown (always cleaned); binary in Nix store protected by system profile |
 | Images (`images.*`) | Images loaded into runtime's own storage via `container image load` | Removed with `content/` unless `preserveImagesOnDisable = true` |
@@ -167,11 +174,11 @@ Every feature that creates state outside the Nix store MUST clean it up when dis
 
 ### nix-darwin's `userLaunchd` limitation
 
-nix-darwin's user agent cleanup script is gated by `mkIf (... || userLaunchAgents != [])`. When ALL user agents are removed from config, the cleanup script never runs. Our module handles this explicitly in postActivation by globbing `dev.apple.container.*.plist` files and unloading stale agents.
+nix-darwin's `userLaunchd` path uses legacy `launchctl asuser ... load -w`, which is brittle on headless SSH-driven Macs and was the source of the `Error 134` / `SIGABRT` regressions. The module no longer relies on `launchd.user.agents` for container jobs; it installs Background-session plists in `/Library/LaunchAgents` and uses explicit `launchctl bootstrap user/<uid> ...` for the managed jobs. `module/compat.nix` still cleans up stale legacy user LaunchAgents and stale system LaunchDaemons during enabled migrations, while leaving the current `/Library/LaunchAgents` set alone.
 
 ### Plist filename convention
 
-Plist filenames are derived from `serviceConfig.Label`, NOT the nix-darwin attribute name. Our agents use `Label = "dev.apple.container.${name}"`, so plists are `dev.apple.container.${name}.plist`. The reconciliation glob pattern must match this.
+Plist filenames are derived from `serviceConfig.Label`, NOT the nix-darwin attribute name. Our managed jobs use `Label = "dev.apple.container.${name}"`, so plists are `dev.apple.container.${name}.plist`. The compatibility cleanup glob pattern must match this.
 
 ## Garbage collection
 
@@ -188,7 +195,7 @@ Initial code assumed the `.pkg` extracted to `usr/local/bin/`. Actual structure 
 Defining `launchd.daemons."container-runtime"` as a named attr AND `launchd.daemons = lib.mapAttrs' ...` in the same `config` block causes a Nix evaluation error: "attribute already defined". Fixed by merging into a single attrset with `//`.
 
 ### `container system start` as a launchd daemon
-Running `container system start` as a persistent `KeepAlive = true` daemon causes an infinite loop: the command registers its own launchd services (API server), exits, launchd restarts it, it tries to register again. The log shows endless "Registering API server with launchd... Verifying apiserver is running...". Fixed by moving `system start` to the activation script (runs once) and removing the launchd daemon.
+Running `container system start` as a persistent `KeepAlive = true` daemon causes an infinite loop: the command registers its own launchd services (API server), exits, launchd restarts it, it tries to register again. The log shows endless "Registering API server with launchd... Verifying apiserver is running...". The module avoids that by using a one-shot runtime user agent plus guarded activation-time startup.
 
 ### Root user context during activation
 `darwin-rebuild switch` runs as root. `container image pull` stores data under `$HOME/Library/Application Support/com.apple.container/`. When run as root, this becomes `/var/root/Library/...` — the wrong location. The container runtime running as the actual user can't find the images. Error: `NSCocoaErrorDomain Code=4 ... couldn't be moved to "sha256"`. Fixed by wrapping all container CLI calls with `sudo -u <user> --`.
@@ -199,8 +206,8 @@ Pre-building OCI layout dirs as Nix derivations (`runCommand` with `copyTo`) and
 ### macOS bsdtar argument ordering
 `tar -C dir -cf file .` doesn't work on macOS bsdtar — the `-C` before `-cf` is ignored, producing empty archives. Use `tar cf file -C dir .` instead.
 
-### Headless Mac: launchd user agents fail without a GUI session
-On headless Mac minis (no display, no logged-in console session), the `gui/<uid>` launchd domain doesn't exist. `launchctl load` and user agent plists fail because `launchd.user.agents` targets this domain. Containers declared as user agents won't start. The fix is to enable auto-login so macOS creates a persistent GUI session on boot: `system.defaults.loginwindow.autoLoginUser = "<user>";` in the nix-darwin config, or `sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser <user>` imperatively. Reboot required.
+### Headless Mac: first user session still required
+Apple `container` expects its apiserver in the user's launchd domain. A pure system-daemon setup breaks the client's XPC path even though `LaunchDaemon + UserName` is valid launchd. The module therefore installs Background-session LaunchAgent plists for `system.primaryUser` in `/Library/LaunchAgents` and intentionally requires the first session for that user after boot. A GUI login works, and an SSH login as that same user also works because Apple `container` can run in the `Background` domain.
 
 ### Stale apiserver launchd registration hangs all CLI commands
 If the `container` CLI was previously run from a different install path (e.g., a source build in `.build/debug/`, or a Nix store path that was later garbage collected), launchd retains the apiserver registration pointing to the old binary. Every `container` command — including `--help`, `system status`, `system stop` — hangs indefinitely at "checking if APIServer is alive" because XPC blocks waiting for launchd to activate a binary that doesn't exist (launchd enters exponential throttle). Manual fix: `launchctl bootout user/$(id -u)/com.apple.container.apiserver`. See [#1329](https://github.com/apple/container/issues/1329).
@@ -249,7 +256,7 @@ The API server itself runs as a separate launchd service managed by the containe
 
 ### No deactivation hooks
 nix-darwin has no "on module removed" lifecycle hook. Cleanup happens via:
-- `launchd.daemons` / `launchd.user.agents`: auto-diffed and removed by nix-darwin's activation
+- nix-darwin launchd options: auto-diffed and removed by nix-darwin's activation
 - Custom state: must use `lib.mkIf (!cfg.enable)` to run cleanup when the module is still imported but disabled
 - If the module import is removed entirely, no cleanup runs — user must handle manually or keep the import with `enable = false` first
 
@@ -257,9 +264,9 @@ nix-darwin has no "on module removed" lifecycle hook. Cleanup happens via:
 `system.activationScripts.postActivation.text` with `lib.mkAfter` runs after other activation. Multiple modules appending to the same script are concatenated. Use `lib.mkMerge` with separate `lib.mkIf` blocks for enable/disable logic.
 
 ### launchd.daemons vs launchd.user.agents
-- `launchd.daemons` → `/Library/LaunchDaemons/` — runs as root
-- `launchd.user.agents` → `~/Library/LaunchAgents/` — runs as logged-in user
-- Container commands MUST use `launchd.user.agents` due to per-user state
+- `launchd.daemons` → `/Library/LaunchDaemons/` — loaded by root at boot; can still run as a non-root user via `serviceConfig.UserName`
+- `launchd.user.agents` → `~/Library/LaunchAgents/` — loaded in the primary user's launchd domain; in practice this means the first GUI or SSH/background session for that user
+- This module installs its runtime/container plists into `/Library/LaunchAgents` with `LimitLoadToSessionType = Background` and bootstraps them explicitly into `user/<uid>` because Apple `container` expects the apiserver in the user's launchd domain but nix-darwin's `userLaunchd` loader is brittle
 
 ## Useful links
 
